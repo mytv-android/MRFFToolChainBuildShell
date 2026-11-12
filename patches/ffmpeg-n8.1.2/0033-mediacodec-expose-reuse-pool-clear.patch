@@ -1,0 +1,71 @@
+From 35f58b80c170f7f7439157ccf8afd2ae9b5fdf29 Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Fri, 13 Nov 2026 01:29:52 +0800
+Subject: [PATCH 33/33] =?UTF-8?q?feat(mediacodec):=20=E5=A4=8D=E7=94=A8?=
+ =?UTF-8?q?=E6=B1=A0=E6=B8=85=E7=A9=BA=E5=85=A5=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+软解/硬解切换后不应该沿用上一套配置创建的硬解实例。导出
+ff_mediacodec_dec_clear_reuse_pool()，供上层在解码配置变化时清池。
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ libavcodec/mediacodecdec_common.c | 23 +++++++++++++++++++++++
+ libavcodec/mediacodecdec_common.h |  8 ++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 84507f7167..b1c67c73e3 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -271,6 +271,29 @@ static MediaCodecPoolEntry *mc_pool;
+ static int mc_pool_count;
+ static AVMutex mc_pool_mutex = AV_MUTEX_INITIALIZER;
+ 
++static void mediacodec_pool_entry_destroy(MediaCodecPoolEntry *entry);
++
++/*
++ * 清空复用池。软解/硬解切换、以及组件或内核重启后不应该沿用旧的硬解实例：
++ * 旧池里的实例来自另一套解码配置，复用只会把状态问题带过去。
++ */
++void ff_mediacodec_dec_clear_reuse_pool(void)
++{
++    MediaCodecPoolEntry *evict;
++
++    ff_mutex_lock(&mc_pool_mutex);
++    evict = mc_pool;
++    mc_pool = NULL;
++    mc_pool_count = 0;
++    ff_mutex_unlock(&mc_pool_mutex);
++
++    while (evict) {
++        MediaCodecPoolEntry *next = evict->next;
++        mediacodec_pool_entry_destroy(evict);
++        evict = next;
++    }
++}
++
+ static void mediacodec_pool_entry_destroy(MediaCodecPoolEntry *entry)
+ {
+     if (!entry)
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 77a3332cea..b41497525b 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -99,6 +99,14 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
+ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
+                                   MediaCodecDecContext *s);
+ 
++/**
++ * 清空进程级解码器复用池。
++ *
++ * 软解/硬解切换后不应继续沿用上一套配置留下的硬解实例：池里的实例是在旧的
++ * hwdec 条件下创建的，复用只会把那个状态带进新的解码会话。
++ */
++void ff_mediacodec_dec_clear_reuse_pool(void);
++
+ typedef struct MediaCodecBuffer {
+ 
+     MediaCodecDecContext *ctx;

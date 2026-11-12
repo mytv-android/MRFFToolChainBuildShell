@@ -1,0 +1,123 @@
+From 8b020db27a0d5b783c3fb043d673336134ad132e Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Fri, 13 Nov 2026 00:59:19 +0800
+Subject: [PATCH 32/33] =?UTF-8?q?fix(mediacodec):=20=E5=87=BA=E8=BF=87=20f?=
+ =?UTF-8?q?atal=20=E9=94=99=E8=AF=AF=E7=9A=84=E8=A7=A3=E7=A0=81=E5=99=A8?=
+ =?UTF-8?q?=E5=AE=9E=E4=BE=8B=E4=B8=8D=E5=86=8D=E8=BF=9B=E5=A4=8D=E7=94=A8?=
+ =?UTF-8?q?=E6=B1=A0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+复用池只按 codec_name + surface 匹配。播放过硬解解不了的源时，MediaCodec
+被推进 error 状态，但 stop() 仍返回成功，实例照常入池。之后同编码同 Surface
+的频道取到这个坏实例，configure/start 能过、解码却出不来帧，表现为换台后
+一直黑屏/加载超时，只能换台或重开应用。
+
+给 MediaCodecDecContext 加 unusable 标记：send/receive 返回 fatal 错误
+（EAGAIN/EOF 除外）或 flush 失败时置位，close 时不再入池，改由 unref
+正常销毁。
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ libavcodec/mediacodecdec_common.c | 45 +++++++++++++++++++++++++++----
+ libavcodec/mediacodecdec_common.h |  2 ++
+ 2 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 65e0d029ff..84507f7167 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -1077,8 +1077,8 @@ fail:
+     return ret;
+ }
+ 
+-int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                           AVPacket *pkt, bool wait)
++static int mediacodec_dec_send_inner(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                     AVPacket *pkt, bool wait)
+ {
+     int offset = 0;
+     int need_draining = 0;
+@@ -1171,8 +1171,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+     return offset;
+ }
+ 
+-int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                              AVFrame *frame, bool wait)
++static int mediacodec_dec_receive_inner(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                        AVFrame *frame, bool wait)
+ {
+     int ret;
+     uint8_t *data;
+@@ -1284,6 +1284,39 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+     return AVERROR(EAGAIN);
+ }
+ 
++/*
++ * 走到这里的 fatal 错误说明 MediaCodec 实例本身处于坏状态（典型是解不了的源把它
++ * 推进 error 状态）。这样的实例不能进复用池，否则下一个频道拿到它必定也解不出来。
++ * EAGAIN / EOF 是正常流程信号，不算。
++ */
++static void mediacodec_note_error(AVCodecContext *avctx, MediaCodecDecContext *s, int ret)
++{
++    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
++        if (!s->unusable) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "MediaCodec %p hit a fatal error (%d), excluding it from the reuse pool\n",
++                   s->codec, ret);
++        }
++        s->unusable = 1;
++    }
++}
++
++int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
++                           AVPacket *pkt, bool wait)
++{
++    int ret = mediacodec_dec_send_inner(avctx, s, pkt, wait);
++    mediacodec_note_error(avctx, s, ret);
++    return ret;
++}
++
++int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
++                              AVFrame *frame, bool wait)
++{
++    int ret = mediacodec_dec_receive_inner(avctx, s, frame, wait);
++    mediacodec_note_error(avctx, s, ret);
++    return ret;
++}
++
+ /*
+ * ff_mediacodec_dec_flush returns 0 if the flush cannot be performed on
+ * the codec (because the user retains frames). The codec stays in the
+@@ -1304,6 +1337,8 @@ int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
+         /* No frames (holding a reference to the codec) are retained by the
+          * user, thus we can flush the codec and returns accordingly */
+         if ((ret = mediacodec_dec_flush_codec(avctx, s)) < 0) {
++            /* flush 都失败说明实例已经不可用，不能再回池 */
++            s->unusable = 1;
+             return ret;
+         }
+ 
+@@ -1324,7 +1359,7 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+      * 池拿走 codec 之后必须把它从 context 上摘掉，否则 unref 会把同一个实例删掉两次。
+      */
+     int poolable = avctx && avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->codec &&
+-                   s->codec_name && s->surface &&
++                   s->codec_name && s->surface && !s->unusable &&
+                    atomic_load(&s->hw_buffer_count) == 0 &&
+                    atomic_load(&s->refcount) == 1;
+ 
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 0ab29036bd..77a3332cea 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -68,6 +68,8 @@ typedef struct MediaCodecDecContext {
+     ssize_t current_input_buffer;
+ 
+     bool delay_flush;
++    /* 这个 MediaCodec 实例出过 fatal 错误，不能再进复用池给下一个源用 */
++    int unusable;
+     atomic_int serial;
+ 
+     bool use_ndk_codec;
