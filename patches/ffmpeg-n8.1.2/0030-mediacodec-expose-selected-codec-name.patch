@@ -1,0 +1,52 @@
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 4e9b56a..2f240b9 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -39,6 +39,16 @@ typedef struct AVMediaCodecContext {
+ 
+ } AVMediaCodecContext;
+ 
++/**
++ * Get the MediaCodec implementation name (e.g. "c2.qti.avc.decoder",
++ * "OMX.qcom.video.decoder.avc") selected for this decoder context.
++ *
++ * The returned string is owned by the decoder; copy it before closing the
++ * codec context. Returns NULL for non-MediaCodec decoders or before the
++ * decoder has been initialized.
++ */
++const char *av_mediacodec_get_selected_codec_name(AVCodecContext *avctx);
++
+ /**
+  * Allocate and initialize a MediaCodec context.
+  *
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index ea9362b..a0ea6b8 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -42,6 +42,7 @@
+ #include "hwconfig.h"
+ #include "internal.h"
+ #include "jni.h"
++#include "mediacodec.h"
+ #include "mediacodec_wrapper.h"
+ #include "mediacodecdec_common.h"
+ 
+@@ -61,6 +62,18 @@ typedef struct MediaCodecH264DecContext {
+     int operating_rate;
+ } MediaCodecH264DecContext;
+ 
++const char *av_mediacodec_get_selected_codec_name(AVCodecContext *avctx)
++{
++    MediaCodecH264DecContext *s;
++
++    if (!avctx || !avctx->priv_data || !avctx->codec || !avctx->codec->name)
++        return NULL;
++    if (!strstr(avctx->codec->name, "mediacodec"))
++        return NULL;
++    s = avctx->priv_data;
++    return s->ctx ? s->ctx->codec_name : NULL;
++}
++
+ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+ {
+     MediaCodecH264DecContext *s = avctx->priv_data;
