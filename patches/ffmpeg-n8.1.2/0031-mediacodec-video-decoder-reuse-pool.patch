@@ -1,0 +1,303 @@
+From 105b3454f32c0fa072a1252ed5f8ee083f7f378c Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Thu, 12 Nov 2026 14:15:41 +0800
+Subject: [PATCH] feat(mediacodec): add process-wide video decoder reuse pool
+ =?UTF-8?q?=E7=A0=81=E5=99=A8=E8=BF=9B=E7=A8=8B=E7=BA=A7=E5=A4=8D=E7=94=A8?=
+ =?UTF-8?q?=E6=B1=A0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+换台改走 stop() 后播放器与渲染器保持存活，Surface 不再重建，MediaCodec
+实例允许 stop() 后重新 configure()，可以跨解码器复用。池按编码名与
+Surface 匹配，只复用两者完全相同的实例：分辨率变化后重新 configure 未必
+比重建快，还可能踩到厂商实现的问题。
+
+池条目自持 Surface 强引用，避免旧播放器释放后键里的指针悬空。只有视频、
+无待返回硬件缓冲、且无其他引用时才入池；池接管后必须从 context 摘掉
+codec，否则 unref 会重复删除。复用的实例 configure/start 失败时丢弃并新建
+重试。
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ libavcodec/mediacodecdec_common.c | 205 +++++++++++++++++++++++++++++-
+ 1 file changed, 200 insertions(+), 5 deletions(-)
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 9b91c8e..d8fd5f2 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -32,6 +32,7 @@
+ #include "libavutil/time.h"
+ #include "libavutil/timestamp.h"
+ #include "libavutil/channel_layout.h"
++#include "libavutil/thread.h"
+ 
+ #include "avcodec.h"
+ #include "decode.h"
+@@ -249,6 +250,144 @@ static void ff_mediacodec_dec_ref(MediaCodecDecContext *s)
+     atomic_fetch_add(&s->refcount, 1);
+ }
+ 
++/*
++ * 进程级的 MediaCodec 复用池。
++ *
++ * 换台时解码器会被销毁重建，但渲染出来的 Surface 往往不变（mpv 的 vo 与
++ * AImageReader 在换台时保持存活）。MediaCodec 实例允许 stop() 后重新 configure()，
++ * 复用它可以省掉创建实例与查询解码器能力的开销。只在编码名与 Surface 都相同时复用：
++ * 分辨率变化后重新 configure 未必比重建快，还可能踩到厂商实现的问题。
++ */
++#define MC_POOL_CAPACITY 2
++
++typedef struct MediaCodecPoolEntry {
++    char *codec_name;
++    FFANativeWindow *surface;   /* 自持一份 surface 引用，保证键里的 Surface 不被释放 */
++    FFAMediaCodec *codec;
++    struct MediaCodecPoolEntry *next;
++} MediaCodecPoolEntry;
++
++static MediaCodecPoolEntry *mc_pool;
++static int mc_pool_count;
++static AVMutex mc_pool_mutex = AV_MUTEX_INITIALIZER;
++
++static void mediacodec_pool_entry_destroy(MediaCodecPoolEntry *entry)
++{
++    if (!entry)
++        return;
++
++    if (entry->codec)
++        ff_AMediaCodec_delete(entry->codec);
++    if (entry->surface)
++        ff_mediacodec_surface_unref(entry->surface, NULL);
++    av_freep(&entry->codec_name);
++    av_free(entry);
++}
++
++static int mediacodec_pool_same_surface(const FFANativeWindow *a, const FFANativeWindow *b)
++{
++    return a && b && a->surface == b->surface && a->native_window == b->native_window;
++}
++
++/* 池里保存的是 Surface 的强引用；否则旧播放器释放后这个指针就成了悬空值。 */
++static FFANativeWindow *mediacodec_pool_ref_surface(FFANativeWindow *surface)
++{
++    if (!surface)
++        return NULL;
++    return ff_mediacodec_surface_ref(surface->surface, surface->native_window, NULL);
++}
++
++/* 取回一个已停止的实例，同时带着它的 codec_name；调用方负责最终释放。 */
++static FFAMediaCodec *mediacodec_pool_take_codec(const char *codec_name,
++                                                 FFANativeWindow *surface,
++                                                 void *log_ctx)
++{
++    FFAMediaCodec *found = NULL;
++    MediaCodecPoolEntry *prev = NULL;
++
++    ff_mutex_lock(&mc_pool_mutex);
++    MediaCodecPoolEntry *entry = mc_pool;
++    while (entry) {
++        if (!strcmp(entry->codec_name, codec_name) &&
++            mediacodec_pool_same_surface(entry->surface, surface)) {
++            MediaCodecPoolEntry *next = entry->next;
++            if (prev)
++                prev->next = next;
++            else
++                mc_pool = next;
++            mc_pool_count--;
++            found = entry->codec;
++            entry->codec = NULL;
++            av_log(log_ctx, AV_LOG_DEBUG, "Reusing MediaCodec %p (%s)\n",
++                   found, codec_name);
++            break;
++        }
++        prev = entry;
++        entry = entry->next;
++    }
++    ff_mutex_unlock(&mc_pool_mutex);
++
++    if (found && entry)
++        mediacodec_pool_entry_destroy(entry);
++
++    return found;
++}
++
++/*
++ * 把已 stop 的实例挂进池；池满时淘汰最旧的一条。
++ * 返回 1 表示池接管了这个实例，返回 0 表示没有接手，调用方仍然要负责释放。
++ */
++static int mediacodec_pool_put_codec(FFAMediaCodec *codec, const char *codec_name,
++                                     FFANativeWindow *surface, void *log_ctx)
++{
++    MediaCodecPoolEntry *entry;
++    MediaCodecPoolEntry *evict = NULL;
++
++    if (!codec || !codec_name || !surface)
++        return 0;
++
++    entry = av_mallocz(sizeof(*entry));
++    if (!entry)
++        return 0;
++
++    entry->codec_name = av_strdup(codec_name);
++    entry->surface = mediacodec_pool_ref_surface(surface);
++    entry->codec = codec;
++    if (!entry->codec_name || !entry->surface) {
++        av_freep(&entry->codec_name);
++        if (entry->surface)
++            ff_mediacodec_surface_unref(entry->surface, log_ctx);
++        av_free(entry);
++        return 0;
++    }
++
++    ff_mutex_lock(&mc_pool_mutex);
++    if (mc_pool_count >= MC_POOL_CAPACITY) {
++        MediaCodecPoolEntry *prev = NULL;
++        evict = mc_pool;
++        while (evict && evict->next) {
++            prev = evict;
++            evict = evict->next;
++        }
++        if (evict) {
++            if (prev)
++                prev->next = NULL;
++            else
++                mc_pool = NULL;
++            mc_pool_count--;
++        }
++    }
++    entry->next = mc_pool;
++    mc_pool = entry;
++    mc_pool_count++;
++    ff_mutex_unlock(&mc_pool_mutex);
++
++    if (evict)
++        mediacodec_pool_entry_destroy(evict);
++
++    return 1;
++}
++
+ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+ {
+     if (!s)
+@@ -739,7 +878,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+ }
+ 
+ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                                          const char *mime, FFAMediaFormat *format)
++                                          const char *mime, FFAMediaFormat *format,
++                                          int *codec_reused)
+ {
+     int profile;
+ 
+@@ -787,9 +927,17 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+         av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
+     }
+ 
+-    if (s->codec_name)
+-        s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
+-    else {
++    /* 先看能不能捡回一个刚 stop 的同编码、同 Surface 实例，省掉创建与能力查询。 */
++    if (s->codec_name && s->surface) {
++        s->codec = mediacodec_pool_take_codec(s->codec_name, s->surface, avctx);
++        if (s->codec && codec_reused)
++            *codec_reused = 1;
++    }
++
++    if (s->codec_name) {
++        if (!s->codec)
++            s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
++    } else {
+         s->codec = ff_AMediaCodec_createDecoderByType(mime, s->use_ndk_codec);
+         if (s->codec) {
+             s->codec_name = ff_AMediaCodec_getName(s->codec);
+@@ -835,17 +983,36 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+     atomic_init(&s->hw_buffer_count, 0);
+     atomic_init(&s->serial, 1);
+     s->current_input_buffer = -1;
++    int reused = 0;
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
+         ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
+     else if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
+-        ret = mediacodec_dec_get_video_codec(avctx, s, mime, format);
++        ret = mediacodec_dec_get_video_codec(avctx, s, mime, format, &reused);
+     else
+         av_assert0(0);
+     if (ret < 0)
+         goto fail;
+ 
+     status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
++    if (status < 0 && reused) {
++        /*
++         * 复用的实例 configure 失败（部分厂商实现不支持跨会话复用），丢掉它换新建实例。
++         * 不能让池里的实例把本次起播直接拖死。
++         */
++        av_log(avctx, AV_LOG_WARNING, "Reused MediaCodec failed to configure, creating a new one\n");
++        ff_AMediaCodec_delete(s->codec);
++        av_freep(&s->codec_name);
++        s->codec = NULL;
++        reused = 0;
++        if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
++            ret = mediacodec_dec_get_video_codec(avctx, s, mime, format, NULL);
++        else
++            ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
++        if (ret < 0)
++            goto fail;
++        status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
++    }
+     if (status < 0) {
+         char *desc = ff_AMediaFormat_toString(format);
+         av_log(avctx, AV_LOG_ERROR,
+@@ -858,6 +1025,22 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+     }
+ 
+     status = ff_AMediaCodec_start(s->codec);
++    if (status < 0 && reused) {
++        av_log(avctx, AV_LOG_WARNING, "Reused MediaCodec failed to start, creating a new one\n");
++        ff_AMediaCodec_delete(s->codec);
++        av_freep(&s->codec_name);
++        s->codec = NULL;
++        reused = 0;
++        if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
++            ret = mediacodec_dec_get_video_codec(avctx, s, mime, format, NULL);
++        else
++            ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
++        if (ret < 0)
++            goto fail;
++        status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
++        if (status >= 0)
++            status = ff_AMediaCodec_start(s->codec);
++    }
+     if (status < 0) {
+         char *desc = ff_AMediaFormat_toString(format);
+         av_log(avctx, AV_LOG_ERROR,
+@@ -1131,6 +1314,14 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+     if (!s)
+         return 0;
+ 
++    /*
++     * 只有视频、且没有待返回的硬件缓冲、也没有别的引用（用户还持有 frame）时才能入池。
++     * 池拿走 codec 之后必须把它从 context 上摘掉，否则 unref 会把同一个实例删掉两次。
++     */
++    int poolable = avctx && avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->codec &&
++                   s->codec_name && s->surface &&
++                   atomic_load(&s->hw_buffer_count) == 0 &&
++                   atomic_load(&s->refcount) == 1;
+     if (s->codec) {
+         if (atomic_load(&s->hw_buffer_count) == 0) {
+             ff_AMediaCodec_stop(s->codec);
+@@ -1140,6 +1331,10 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+         }
+     }
+ 
++    if (poolable && mediacodec_pool_put_codec(s->codec, s->codec_name, s->surface, avctx)) {
++        /* 池自己 strdup 了一份名字，这里必须摘掉 codec，否则 unref 会再删一次。 */
++        s->codec = NULL;
++    }
+     ff_mediacodec_dec_unref(s);
+ 
+     return 0;
+-- 
+2.51.0.windows.1
+
