@@ -1,0 +1,326 @@
+From ea6b31bc85125f6796ac4ce42be39b3cfa29b059 Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Sun, 15 Nov 2026 22:34:04 +0800
+Subject: [PATCH] =?UTF-8?q?perf(mpegts):=20=E5=85=B3=E9=94=AE=E5=B8=A7=20P?=
+ =?UTF-8?q?ES=20=E5=BC=80=E5=A4=B4=E5=B8=A6=E7=9A=84=20SPS/PPS=20=E6=94=B6?=
+ =?UTF-8?q?=E5=85=A8=E5=B0=B1=E5=A1=AB=E8=A7=86=E9=A2=91=E5=8F=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+换台起播时 H.264 关键帧 PES 开头几个 TS 包里就有 SPS/PPS，但整个 PES
+要等下一个 PES 开头才吐成包，find_stream_info 再从这个包取 extradata、
+解析器才填宽高。关键帧几十到上百 KB，这段要等几十毫秒，播放器之后才
+开始建硬解实例。
+
+新增 mpegts 选项 early_video_params（默认关）：视频流还没有参数时，扫
+正在攒的 PES 开头（最多 8KB），SPS、PPS 都收全就把 extradata（Annex B）、
+宽高、profile/level、像素格式、SAR 填进 codecpar 和内部解码上下文。
+在读包流程里填好后这次读包返回 EAGAIN，find_stream_info 回到循环顶上
+检查中断回调，播放器在那里结束探测，不会像网络读取时打断那样把读了
+一半的 TS 包丢掉、把攒了一半的 PES 当成包吐出去。
+
+ff_avc_decode_sps 顺带算出裁剪后的宽高（H264SPS.width/height）。
+
+模拟器上用同一个 TS 对照：开头就是关键帧时探测从 33ms 降到 3ms，
+从 GOP 中间开始时参数在读包阶段补上；两种情况前 40 个视频包的
+大小、pts、CRC 与不开选项完全一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavformat/avc.c    |  27 ++++++--
+ libavformat/avc.h    |   2 +
+ libavformat/mpegts.c | 159 ++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 181 insertions(+), 7 deletions(-)
+
+diff --git a/libavformat/avc.c b/libavformat/avc.c
+index 84a3c3d..64a7dff 100644
+--- a/libavformat/avc.c
++++ b/libavformat/avc.c
+@@ -197,6 +197,8 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
+ {
+     int i, j, ret, rbsp_size, aspect_ratio_idc, pic_order_cnt_type;
+     int num_ref_frames_in_pic_order_cnt_cycle;
++    unsigned mb_width, map_height, crop_left = 0, crop_right = 0, crop_top = 0, crop_bottom = 0;
++    int crop_unit_x, crop_unit_y;
+     int delta_scale, lastScale = 8, nextScale = 8;
+     int sizeOfScalingList;
+     GetBitContext gb;
+@@ -273,8 +275,8 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
+ 
+     get_ue_golomb_long(&gb); // max_num_ref_frames
+     skip_bits1(&gb); // gaps_in_frame_num_value_allowed_flag
+-    get_ue_golomb_long(&gb); // pic_width_in_mbs_minus1
+-    get_ue_golomb_long(&gb); // pic_height_in_map_units_minus1
++    mb_width   = get_ue_golomb_long(&gb) + 1; // pic_width_in_mbs_minus1
++    map_height = get_ue_golomb_long(&gb) + 1; // pic_height_in_map_units_minus1
+ 
+     sps->frame_mbs_only_flag = get_bits1(&gb);
+     if (!sps->frame_mbs_only_flag)
+@@ -283,10 +285,23 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
+     skip_bits1(&gb); // direct_8x8_inference_flag
+ 
+     if (get_bits1(&gb)) { // frame_cropping_flag
+-        get_ue_golomb_long(&gb); // frame_crop_left_offset
+-        get_ue_golomb_long(&gb); // frame_crop_right_offset
+-        get_ue_golomb_long(&gb); // frame_crop_top_offset
+-        get_ue_golomb_long(&gb); // frame_crop_bottom_offset
++        crop_left   = get_ue_golomb_long(&gb); // frame_crop_left_offset
++        crop_right  = get_ue_golomb_long(&gb); // frame_crop_right_offset
++        crop_top    = get_ue_golomb_long(&gb); // frame_crop_top_offset
++        crop_bottom = get_ue_golomb_long(&gb); // frame_crop_bottom_offset
++    }
++
++    /* 7.4.2.1.1: crop units depend on ChromaArrayType and field coding */
++    crop_unit_x = sps->chroma_format_idc == 1 || sps->chroma_format_idc == 2 ? 2 : 1;
++    crop_unit_y = (sps->chroma_format_idc == 1 ? 2 : 1) * (2 - sps->frame_mbs_only_flag);
++    if (mb_width <= 1024 && map_height <= 1024) {
++        int64_t w = 16LL * mb_width - crop_unit_x * ((int64_t)crop_left + crop_right);
++        int64_t h = 16LL * map_height * (2 - sps->frame_mbs_only_flag) -
++                    crop_unit_y * ((int64_t)crop_top + crop_bottom);
++        if (w > 0 && h > 0) {
++            sps->width  = w;
++            sps->height = h;
++        }
+     }
+ 
+     if (get_bits1(&gb)) { // vui_parameters_present_flag
+diff --git a/libavformat/avc.h b/libavformat/avc.h
+index e36108a..bd7c46d 100644
+--- a/libavformat/avc.h
++++ b/libavformat/avc.h
+@@ -39,6 +39,8 @@ typedef struct {
+     uint8_t bit_depth_chroma;
+     uint8_t frame_mbs_only_flag;
+     AVRational sar;
++    int width;              ///< cropped picture width, 0 if unknown
++    int height;             ///< cropped picture height, 0 if unknown
+ } H264SPS;
+ 
+ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size);
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index 427bb88..4382c27 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -32,17 +32,22 @@
+ #include "libavutil/opt.h"
+ #include "libavutil/avassert.h"
+ #include "libavutil/dovi_meta.h"
++#include "libavcodec/avcodec.h"
+ #include "libavcodec/bytestream.h"
+ #include "libavcodec/defs.h"
+ #include "libavcodec/get_bits.h"
++#include "libavcodec/h264.h"
+ #include "libavcodec/opus/opus.h"
++#include "libavcodec/startcode.h"
+ #include "avformat.h"
+ #include "mpegts.h"
+ #include "internal.h"
+ #include "avio_internal.h"
++#include "avc.h"
+ #include "demux.h"
+ #include "mpeg.h"
+ #include "isom.h"
++#include "nal.h"
+ #if CONFIG_ICONV
+ #include <iconv.h>
+ #endif
+@@ -162,6 +167,11 @@ struct MpegTSContext {
+ 
+     int scan_all_pmts;
+ 
++    /** 视频 PES 开头带的 H.264 参数集一收全就填进流参数（见 mpegts_early_video_params） */
++    int early_video_params;
++    /** 本次读包刚填好参数、没有包要交：mpegts_read_packet 返回 EAGAIN */
++    int early_params_ready;
++
+     int resync_size;
+     int merge_pmt_versions;
+     int max_packet_size;
+@@ -212,6 +222,8 @@ static const AVOption options[] = {
+      {.i64 = 0}, 0, 1, 0 },
+     {"max_packet_size", "maximum size of emitted packet", offsetof(MpegTSContext, max_packet_size), AV_OPT_TYPE_INT,
+      {.i64 = 204800}, 1, INT_MAX/2, AV_OPT_FLAG_DECODING_PARAM },
++    {"early_video_params", "export H.264 SPS/PPS, size and profile as soon as the start of a video PES carries them",
++     offsetof(MpegTSContext, early_video_params), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
+     { NULL },
+ };
+ 
+@@ -1174,6 +1186,147 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
+ }
+ 
+ /* return non zero if a packet could be constructed */
++/*
++ * 换台起播用（early_video_params）：H.264 关键帧 PES 开头的几个 TS 包里就带着 SPS/PPS，
++ * 但整个 PES 要等下一个 PES 开头才吐成包，find_stream_info 再从这个包里取 extradata、
++ * 解析器才填宽高。关键帧有几十到上百 KB，这一段要等几十毫秒。
++ *
++ * 视频流还没有参数时，扫一眼正在攒的 PES 开头：SPS、PPS 都收全了，就把 extradata、
++ * 宽高、profile/level、像素格式直接填进 codecpar 和内部解码上下文，播放器可以先建硬解
++ * 实例，关键帧剩下的部分边下边等。在读包流程里（ts->pkt 非空）填好后让这一次读包
++ * 返回 EAGAIN：调用方（find_stream_info 的循环）回到循环顶上检查中断回调，播放器在
++ * 那里结束探测，不用等下一次网络读取时打断，那样会把读了一半的 TS 包丢掉。
++ */
++#define EARLY_PARAMS_SCAN_MAX 8192
++
++static enum AVPixelFormat early_h264_pix_fmt(const H264SPS *sps)
++{
++    static const enum AVPixelFormat fmt8[4]  = { AV_PIX_FMT_GRAY8, AV_PIX_FMT_YUV420P,
++                                                 AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P };
++    static const enum AVPixelFormat fmt10[4] = { AV_PIX_FMT_GRAY10, AV_PIX_FMT_YUV420P10,
++                                                 AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10 };
++
++    if (sps->chroma_format_idc > 3)
++        return AV_PIX_FMT_NONE;
++    if (sps->bit_depth_luma == 8)
++        return fmt8[sps->chroma_format_idc];
++    if (sps->bit_depth_luma == 10)
++        return fmt10[sps->chroma_format_idc];
++    return AV_PIX_FMT_NONE;
++}
++
++static int early_h264_profile(const H264SPS *sps)
++{
++    int profile = sps->profile_idc;
++
++    /* 与 libavcodec ff_h264_get_profile() 一致 */
++    switch (sps->profile_idc) {
++    case AV_PROFILE_H264_BASELINE:
++        profile |= (sps->constraint_set_flags & 1 << 1) ? AV_PROFILE_H264_CONSTRAINED : 0;
++        break;
++    case AV_PROFILE_H264_HIGH_10:
++    case AV_PROFILE_H264_HIGH_422:
++    case AV_PROFILE_H264_HIGH_444_PREDICTIVE:
++        profile |= (sps->constraint_set_flags & 1 << 3) ? AV_PROFILE_H264_INTRA : 0;
++        break;
++    }
++    return profile;
++}
++
++static void mpegts_early_video_params(PESContext *pes)
++{
++    MpegTSContext *ts = pes->ts;
++    AVStream *st = pes->st;
++    FFStream *sti;
++    const uint8_t *p, *end, *sps = NULL, *pps = NULL;
++    int sps_size = 0, pps_size = 0, size;
++    H264SPS info;
++    uint8_t *extradata, *copy = NULL;
++
++    if (!st || st->codecpar->codec_id != AV_CODEC_ID_H264 || st->codecpar->extradata ||
++        !pes->buffer)
++        return;
++    sti = ffstream(st);
++    if (sti->avctx && sti->avctx->extradata)
++        return;
++
++    p   = pes->buffer->data;
++    end = p + FFMIN(pes->data_index, EARLY_PARAMS_SCAN_MAX);
++    while (p < end && !(sps && pps)) {
++        uint32_t state = -1;
++        const uint8_t *nal = avpriv_find_start_code(p, end, &state);
++        const uint8_t *nal_end;
++        int type;
++
++        if (nal >= end)
++            return;
++        type = state & 0x1f;
++        if (type == H264_NAL_SLICE || type == H264_NAL_IDR_SLICE)
++            return; /* 到图像数据了：这个 PES 开头没有参数集 */
++        nal_end = ff_nal_find_startcode(nal, end);
++        if (nal_end >= end)
++            return; /* 这个 NAL 还没收全，等后面的 TS 包 */
++        if (type == H264_NAL_SPS && !sps) {
++            sps      = nal - 1;
++            sps_size = nal_end - sps;
++        } else if (type == H264_NAL_PPS && !pps) {
++            pps      = nal - 1;
++            pps_size = nal_end - pps;
++        }
++        p = nal_end;
++    }
++    if (!sps || !pps || sps_size < 4 || pps_size < 2)
++        return;
++    if (ff_avc_decode_sps(&info, sps + 1, sps_size - 1) < 0 || !info.width || !info.height)
++        return;
++
++    size = 4 + sps_size + 4 + pps_size;
++    extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (sti->avctx)
++        copy = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!extradata || (sti->avctx && !copy)) {
++        av_free(extradata);
++        av_free(copy);
++        return;
++    }
++    AV_WB32(extradata, 1);
++    memcpy(extradata + 4, sps, sps_size);
++    AV_WB32(extradata + 4 + sps_size, 1);
++    memcpy(extradata + 8 + sps_size, pps, pps_size);
++
++    st->codecpar->extradata           = extradata;
++    st->codecpar->extradata_size      = size;
++    st->codecpar->width               = info.width;
++    st->codecpar->height              = info.height;
++    st->codecpar->profile             = early_h264_profile(&info);
++    st->codecpar->level               = info.level_idc;
++    st->codecpar->format              = early_h264_pix_fmt(&info);
++    st->codecpar->sample_aspect_ratio = info.sar;
++    if (sti->avctx) {
++        AVCodecContext *avctx = sti->avctx;
++        memcpy(copy, extradata, size);
++        av_freep(&avctx->extradata);
++        avctx->extradata           = copy;
++        avctx->extradata_size      = size;
++        avctx->width               = info.width;
++        avctx->height              = info.height;
++        avctx->profile             = st->codecpar->profile;
++        avctx->level               = info.level_idc;
++        avctx->pix_fmt             = st->codecpar->format;
++        avctx->sample_aspect_ratio = info.sar;
++    }
++
++    av_log(ts->stream, AV_LOG_INFO,
++           "early video params: stream %d %dx%d profile %d level %d from the first %d bytes of a PES\n",
++           st->index, info.width, info.height, st->codecpar->profile, info.level_idc,
++           pes->data_index);
++
++    if (ts->pkt) {
++        ts->stop_parse = 1;
++        ts->early_params_ready = 1;
++    }
++}
++
+ static int mpegts_push_data(MpegTSFilter *filter,
+                             const uint8_t *buf, int buf_size, int is_start,
+                             int64_t pos)
+@@ -1442,6 +1595,8 @@ skip:
+ 
+                 memcpy(pes->buffer->data + pes->data_index, p, buf_size);
+                 pes->data_index += buf_size;
++                if (ts->early_video_params && pes->data_index - buf_size < EARLY_PARAMS_SCAN_MAX)
++                    mpegts_early_video_params(pes);
+                 /* emit complete packets with known packet size
+                  * decreases demuxer delay for infrequent packets like subtitles from
+                  * a couple of seconds to milliseconds for properly muxed files. */
+@@ -3496,6 +3651,7 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
+ 
+     pkt->size = -1;
+     ts->pkt = pkt;
++    ts->early_params_ready = 0;
+     ret = handle_packets(ts, 0);
+     if (ret < 0) {
+         av_packet_unref(ts->pkt);
+@@ -3515,7 +3671,8 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
+     }
+ 
+     if (!ret && pkt->size < 0)
+-        ret = AVERROR_INVALIDDATA;
++        ret = ts->early_params_ready ? AVERROR(EAGAIN) : AVERROR_INVALIDDATA;
++    ts->early_params_ready = 0;
+     return ret;
+ }
+ 
+-- 
+2.51.0.windows.1
+
