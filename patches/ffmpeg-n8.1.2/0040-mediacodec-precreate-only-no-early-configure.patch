@@ -1,0 +1,635 @@
+From a6074b47b5326c9189d7479c81a0365ba7089fa9 Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Sun, 15 Nov 2026 22:05:37 +0800
+Subject: [PATCH] =?UTF-8?q?fix(mediacodec):=20=E6=8D=A2=E5=8F=B0=E5=8F=AA?=
+ =?UTF-8?q?=E5=90=8E=E5=8F=B0=E9=A2=84=E5=BB=BA=E8=A7=A3=E7=A0=81=E5=99=A8?=
+ =?UTF-8?q?=E5=AE=9E=E4=BE=8B=EF=BC=8C=E4=B8=8D=E5=86=8D=E6=8C=89=E6=97=A7?=
+ =?UTF-8?q?=E5=8F=B0=E5=8F=82=E6=95=B0=E6=8F=90=E5=89=8D=20configure?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pixel 8 Pro 实测：预热实例按上一个台的 SPS/PPS configure + start 好，
+新台参数不同时 stop 后重配（0039），换到 CCTV-9 时解码器输入满、一帧
+不出，等满 25 秒超时黑屏；0037 中途塞新参数集也是同一个台卡死。同一个
+台用现建的实例一切正常，问题出在实例先按别的台的参数配置过。
+
+改成后台只 create，不 configure、不碰 Surface：旧实例最后一次 unref 时
+交给后台线程 stop + delete，再按同一个解码器名新建一个实例；下一个流
+init 时领走，照常拿新流的 format configure + start，和现建的实例没有
+区别，只省掉新建那一段（实测 20~40ms）。
+
+- 预建实例不绑输出目标，去掉 Surface/ANativeWindow 比对、csd 与宽高
+  比对、stop 重配和 format 转交
+- 卡住时不再关掉本进程的预建（预建实例与现建无差别），只保留告警
+- ff_mediacodec_dec_warm_clear 一律删掉未领用的实例，参数保留兼容调用方
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavcodec/mediacodecdec.c        |  13 +-
+ libavcodec/mediacodecdec_common.c | 299 ++++++------------------------
+ libavcodec/mediacodecdec_common.h |  23 +--
+ 3 files changed, 67 insertions(+), 268 deletions(-)
+
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index c4c8e67..667ccb6 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -463,12 +463,6 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+         goto done;
+     }
+ 
+-    /* 关闭时要用这份 format 给下一个流预热实例，所有权交给解码上下文 */
+-    if (s->ctx->warm_ready) {
+-        s->ctx->warm_format = format;
+-        format = NULL;
+-    }
+-
+     av_log(avctx, AV_LOG_INFO,
+            "MediaCodec started successfully: codec = %s, ret = %d\n",
+            s->ctx->codec_name, ret);
+@@ -547,12 +541,9 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+                         s->stall_warned = 1;
+                         av_log(avctx, AV_LOG_WARNING,
+                                "mediacodec stalled: no input buffer and no output frame for %d ms "
+-                               "(codec %s, prewarmed %d, frames out %d)\n",
++                               "(codec %s, precreated %d, frames out %d)\n",
+                                (int)((now - stall_t0) / 1000), s->ctx->codec_name,
+                                s->ctx->warm_reused, (int)s->ctx->output_buffer_count);
+-                        /* 领来的预热实例一帧没出就卡住了：本进程不再预热，别让下一个台再踩 */
+-                        if (s->ctx->warm_reused && !s->ctx->output_buffer_count)
+-                            ff_mediacodec_dec_warm_disable();
+                     }
+                     return AVERROR(EAGAIN);
+                 }
+@@ -635,7 +626,7 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
+     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
+             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+-    { "warm_codec", "On close, prewarm a fresh decoder with the same name, surface and format for the next stream",
++    { "warm_codec", "On close, create a decoder instance with the same name in the background for the next stream",
+                     OFFSET(warm_codec), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+     { NULL }
+ };
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index e61b5ad..a93b06c 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -26,8 +26,6 @@
+ #include <sys/types.h>
+ #include <time.h>
+ 
+-#include <android/native_window_jni.h>
+-
+ #include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+ #include "libavutil/hwcontext_mediacodec.h"
+@@ -257,69 +255,36 @@ static void ff_mediacodec_dec_ref(MediaCodecDecContext *s)
+ }
+ 
+ /*
+- * 换台预热。
+- *
+- * 换台时最贵的一步是新建、configure、start 硬解实例（真机约 100 ms）。Media3 换台只
+- * flush 不销毁解码器，所以它的首帧只剩网络、解封装和解一帧。
++ * 换台预建实例。
+  *
+- * 这里不把喂过数据的旧实例给下一个流用：实例身上可能带着厂商内部的坏状态（补丁 0034
+- * 的教训，遇到解不出帧又不报错的源，之后同 Surface 的解码器都解不出画面）。改成在旧实例
+- * 最后一次 unref 时把它交给后台线程：stop + delete 旧实例，紧接着用同一个解码器名、同一个
+- * 输出 Surface、同一份 format 新建并 start 一个实例，停在 warm 槽里。下一个流打开时
+- * （网络 + 探测还要几十到上百毫秒）直接领走这个从没喂过数据的实例，省掉整段建实例；
++ * 换台时建硬解实例要几十毫秒（Pixel 8 Pro 上新建 20~40ms、configure + start 30~120ms）。
++ * 旧实例最后一次 unref 时把它交给后台线程：stop + delete 旧实例，再用同一个解码器名
++ * 新建一个实例，停在 warm 槽里。下一个流 init 时直接领走它，省掉新建那一段；
+  * 旧实例的 stop/delete 也不再压在换台路径上。
+  *
+- * 领用条件是「拿新流的 format 新建一个实例，结果跟它完全一样」：解码器名、mime、宽高、
+- * csd-0/csd-1（SPS/PPS）逐字节相同，输出 Surface 是同一个 ANativeWindow（format 里只有
+- * 这些，外加播放器级的 operating-rate）。SPS/PPS 不同的不领：用旧参数集起好的实例再塞新
+- * 参数集，解码器要中途重配输出缓冲，真机 Exynos 上第 9 个台就卡死了（输入口满、一帧不出）。
+- * 宽高要取 init 之前的值，init 里解析输出 format 会改写 avctx。
+- * 不满足而预热实例占着同一个 Surface 时，先同步删掉它再新建，否则新实例
+- * configure 会因为 Surface 已被连接而失败。
++ * 预建的实例只 create，不 configure、不碰 Surface：领走后照常拿新流的 format configure +
++ * start，和现建的实例没有区别。早先的版本把实例按上一个台的参数 configure + start 好了等
++ * 着，参数不同时 stop 重配或中途塞新 SPS/PPS，真机 Exynos 上第 9 个台（CCTV-9）解码器
++ * 输入满、一帧不出；同一个台用现建的实例正常。
+  *
+- * 只有 close 时没有在外的帧（refcount == 1、无待还的硬件缓冲）才走预热：帧还被渲染端
+- * 握着时，最后一次 unref 可能晚于下一个流的 init，预热实例会跟新实例抢同一个 Surface。
++ * 只有 close 时没有在外的帧（refcount == 1、无待还的硬件缓冲）才交给后台线程：帧还被
++ * 渲染端握着时，旧实例要等最后一次 unref 才能删。
+  */
+ typedef struct MediaCodecWarm {
+     FFAMediaCodec *old_codec;   /* 待 stop/delete 的旧实例 */
+-    FFAMediaCodec *codec;       /* 预热好的新实例：已 start，没喂过数据 */
+-    FFAMediaFormat *format;     /* configure 用的 format（来自旧流） */
+-    FFANativeWindow *surface;
+-    ANativeWindow *window;      /* 只用来判断是不是同一个输出目标 */
++    FFAMediaCodec *codec;       /* 预建的新实例：只 create 过 */
+     char *codec_name;
+     char *mime;
+     int use_ndk_codec;
+-    int width;
+-    int height;
+-    uint8_t *csd;               /* configure 时 format 里的 csd-0 + csd-1，领用时逐字节比 */
+-    int csd_size;
+-    int csd0_size;
+ } MediaCodecWarm;
+ 
+ static pthread_mutex_t mc_warm_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t mc_warm_cond = PTHREAD_COND_INITIALIZER;
+-static int mc_warm_pending;         /* 还在跑的预热线程数 */
+-static MediaCodecWarm *mc_warm;     /* 预热好、等着被领用的实例，最多一个 */
+-static int mc_warm_disabled;        /* 领来的预热实例出过问题，本进程不再预热 */
++static int mc_warm_pending;         /* 还在跑的预建线程数 */
++static MediaCodecWarm *mc_warm;     /* 预建好、等着被领用的实例，最多一个 */
+ 
+ #define MC_WARM_WAIT_SEC 1
+ 
+-static ANativeWindow *mediacodec_warm_window(FFANativeWindow *surface, void *log_ctx)
+-{
+-    JNIEnv *env;
+-
+-    if (!surface)
+-        return NULL;
+-    if (surface->native_window) {
+-        ANativeWindow_acquire(surface->native_window);
+-        return surface->native_window;
+-    }
+-    if (!surface->surface)
+-        return NULL;
+-    env = ff_jni_get_env(log_ctx);
+-    return env ? ANativeWindow_fromSurface(env, surface->surface) : NULL;
+-}
+-
+ static void mediacodec_warm_free(MediaCodecWarm *w)
+ {
+     if (!w)
+@@ -330,61 +295,12 @@ static void mediacodec_warm_free(MediaCodecWarm *w)
+     }
+     if (w->codec)
+         ff_AMediaCodec_delete(w->codec);
+-    if (w->format)
+-        ff_AMediaFormat_delete(w->format);
+-    if (w->surface)
+-        ff_mediacodec_surface_unref(w->surface, NULL);
+-    if (w->window)
+-        ANativeWindow_release(w->window);
+     av_freep(&w->codec_name);
+     av_freep(&w->mime);
+-    av_freep(&w->csd);
+     av_free(w);
+ }
+ 
+-/*
+- * 取 format 里的 csd-0 + csd-1 拼成一块（*out 由调用方 av_free），*size0 是 csd-0 的长度。
+- * 没有 csd 时 *out 为 NULL、长度为 0。
+- */
+-static int mediacodec_format_csd(FFAMediaFormat *format, int use_ndk_codec,
+-                                 uint8_t **out, int *size, int *size0)
+-{
+-    void *csd[2] = { NULL, NULL };
+-    size_t len[2] = { 0, 0 };
+-    static const char *const keys[2] = { "csd-0", "csd-1" };
+-    int ret = 0;
+-
+-    *out = NULL;
+-    *size = *size0 = 0;
+-    for (int i = 0; i < 2; i++) {
+-        /* 长度为 0 时 JNI 版给的是 Java 缓冲的直接地址，不是我们的内存，不能释放 */
+-        if (!ff_AMediaFormat_getBuffer(format, keys[i], &csd[i], &len[i]) || !csd[i] || !len[i]) {
+-            csd[i] = NULL;
+-            len[i] = 0;
+-        }
+-    }
+-    if (len[0] + len[1] > 0) {
+-        *out = av_malloc(len[0] + len[1]);
+-        if (*out) {
+-            if (len[0])
+-                memcpy(*out, csd[0], len[0]);
+-            if (len[1])
+-                memcpy(*out + len[0], csd[1], len[1]);
+-            *size = len[0] + len[1];
+-            *size0 = len[0];
+-        } else {
+-            ret = AVERROR(ENOMEM);
+-        }
+-    }
+-    /* JNI 版 getBuffer 返回的是拷贝，NDK 版返回 format 内部指针 */
+-    if (!use_ndk_codec) {
+-        av_free(csd[0]);
+-        av_free(csd[1]);
+-    }
+-    return ret;
+-}
+-
+-/* 等正在跑的预热线程收尾；调用时必须持有 mc_warm_mutex。 */
++/* 等正在跑的预建线程收尾；调用时必须持有 mc_warm_mutex。 */
+ static void mediacodec_warm_wait_locked(void)
+ {
+     struct timespec deadline;
+@@ -402,8 +318,7 @@ static void *mediacodec_warm_thread(void *arg)
+     MediaCodecWarm *w = arg;
+     MediaCodecWarm *stale = NULL;
+     int64_t t0 = av_gettime_relative();
+-    int64_t t1, t2 = 0, t3 = 0, t4;
+-    int ok = 0;
++    int64_t t1;
+ 
+     ff_AMediaCodec_stop(w->old_codec);
+     ff_AMediaCodec_delete(w->old_codec);
+@@ -411,22 +326,14 @@ static void *mediacodec_warm_thread(void *arg)
+     t1 = av_gettime_relative();
+ 
+     w->codec = ff_AMediaCodec_createCodecByName(w->codec_name, w->use_ndk_codec);
+-    t2 = t3 = av_gettime_relative();
+-    if (w->codec && ff_AMediaCodec_configure(w->codec, w->format, w->surface, NULL, 0) >= 0) {
+-        t3 = av_gettime_relative();
+-        ok = ff_AMediaCodec_start(w->codec) >= 0;
+-    }
+-    t4 = av_gettime_relative();
+ 
+     av_log(NULL, AV_LOG_INFO,
+-           "mediacodec warm: old released in %d ms, %s %dx%d %s in %d ms "
+-           "(create %d, configure %d, start %d)\n",
+-           (int)((t1 - t0) / 1000), w->codec_name, w->width, w->height,
+-           ok ? "ready" : "failed", (int)((t4 - t1) / 1000),
+-           (int)((t2 - t1) / 1000), (int)((t3 - t2) / 1000), (int)((t4 - t3) / 1000));
++           "mediacodec warm: old released in %d ms, %s %s in %d ms\n",
++           (int)((t1 - t0) / 1000), w->codec_name, w->codec ? "created" : "create failed",
++           (int)((av_gettime_relative() - t1) / 1000));
+ 
+     pthread_mutex_lock(&mc_warm_mutex);
+-    if (ok && !mc_warm_disabled) {
++    if (w->codec) {
+         stale = mc_warm;
+         mc_warm = w;
+         w = NULL;
+@@ -441,42 +348,30 @@ static void *mediacodec_warm_thread(void *arg)
+ }
+ 
+ /*
+- * 最后一次 unref 时调用：把旧实例交给预热线程。返回 1 表示已接手（调用方不要再删
++ * 最后一次 unref 时调用：把旧实例交给后台线程。返回 1 表示已接手（调用方不要再删
+  * s->codec），0 表示没接手，调用方照常删除。
+  */
+ static int mediacodec_warm_handoff(MediaCodecDecContext *s)
+ {
+-    FFANativeWindow *surface = s->surface;
+     MediaCodecWarm *w;
+     pthread_attr_t attr;
+     pthread_t tid;
+     int ret;
+ 
+-    if (mc_warm_disabled || !s->warm_handoff || !s->codec || !s->codec_name || !surface ||
+-        !s->warm_format || !s->warm_mime)
++    if (!s->warm_handoff || !s->codec || !s->codec_name || !s->warm_mime)
+         return 0;
+ 
+     w = av_mallocz(sizeof(*w));
+     if (!w)
+         return 0;
+-    w->surface = ff_mediacodec_surface_ref(surface->surface, surface->native_window, NULL);
+-    w->window = mediacodec_warm_window(w->surface, NULL);
+     w->codec_name = av_strdup(s->codec_name);
+     w->mime = av_strdup(s->warm_mime);
+-    if (!w->surface || !w->window || !w->codec_name || !w->mime) {
+-        mediacodec_warm_free(w);
+-        return 0;
+-    }
+-    if (mediacodec_format_csd(s->warm_format, s->use_ndk_codec,
+-                              &w->csd, &w->csd_size, &w->csd0_size) < 0) {
++    if (!w->codec_name || !w->mime) {
+         mediacodec_warm_free(w);
+         return 0;
+     }
+     w->use_ndk_codec = s->use_ndk_codec;
+-    w->width = s->warm_width;
+-    w->height = s->warm_height;
+     w->old_codec = s->codec;
+-    w->format = s->warm_format;
+ 
+     pthread_mutex_lock(&mc_warm_mutex);
+     mc_warm_pending++;
+@@ -491,120 +386,58 @@ static int mediacodec_warm_handoff(MediaCodecDecContext *s)
+         mc_warm_pending--;
+         pthread_cond_broadcast(&mc_warm_cond);
+         pthread_mutex_unlock(&mc_warm_mutex);
+-        /* 线程没起来：旧实例和 format 还给调用方 */
++        /* 线程没起来：旧实例还给调用方 */
+         w->old_codec = NULL;
+-        w->format = NULL;
+         mediacodec_warm_free(w);
+         return 0;
+     }
+-
+-    s->warm_format = NULL;
+     return 1;
+ }
+ 
+-/*
+- * init 时调用：领走同一输出目标上、参数相同的预热实例。领不到返回 NULL；预热实例占着
+- * 同一个 Surface 但参数不符时，同步删掉它，让新实例能 configure 到这个 Surface 上。
+- */
++/* init 时调用：领走同名解码器的预建实例，领不到返回 NULL。 */
+ static FFAMediaCodec *mediacodec_warm_take(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                                           const char *mime, FFAMediaFormat *format,
+-                                           int *started)
++                                           const char *mime)
+ {
+-    ANativeWindow *window = mediacodec_warm_window(s->surface, avctx);
+     MediaCodecWarm *w = NULL;
+     FFAMediaCodec *codec = NULL;
+-    uint8_t *csd = NULL;
+-    int csd_size = 0, csd0_size = 0, csd_same;
+     int64_t t0 = av_gettime_relative();
+ 
+-    if (!window)
+-        return NULL;
+-
+     pthread_mutex_lock(&mc_warm_mutex);
+-    /* 预热线程还在跑：它马上要占同一个 Surface，必须等它收尾再决定 */
++    /* 后台线程可能还在 stop 旧实例、建新实例：等它收尾再看 */
+     mediacodec_warm_wait_locked();
+-    if (mc_warm && mc_warm->window == window) {
+-        w = mc_warm;
+-        mc_warm = NULL;
+-    }
++    w = mc_warm;
++    mc_warm = NULL;
+     pthread_mutex_unlock(&mc_warm_mutex);
+-    ANativeWindow_release(window);
+ 
+     if (!w)
+         return NULL;
+ 
+-    /* 取不出新流的 csd（内存不够）就当不一样处理 */
+-    csd_same = mediacodec_format_csd(format, s->use_ndk_codec, &csd, &csd_size, &csd0_size) >= 0 &&
+-               csd_size == w->csd_size && csd0_size == w->csd0_size &&
+-               (!csd_size || !memcmp(csd, w->csd, csd_size));
+-    *started = 0;
+     if (!strcmp(w->codec_name, s->codec_name) && !strcmp(w->mime, mime) &&
+         w->use_ndk_codec == s->use_ndk_codec) {
+         codec = w->codec;
+         w->codec = NULL;
+-        if (csd_same && w->width == s->warm_width && w->height == s->warm_height) {
+-            /* 和拿新流 format 新建的实例完全一样，直接用 */
+-            *started = 1;
+-            av_log(avctx, AV_LOG_INFO, "mediacodec warm: using prewarmed %s %dx%d csd=%d (waited %d ms)\n",
+-                   s->codec_name, s->warm_width, s->warm_height, csd_size,
+-                   (int)((av_gettime_relative() - t0) / 1000));
+-        } else {
+-            /*
+-             * 同一个解码器、参数集或宽高不同：不能带着旧参数集用（0037 卡死的教训），
+-             * 但组件本身可以留下。stop() 回到未配置状态，调用方按新流 format 正常
+-             * configure + start，省掉新建组件那一段。这个实例没喂过码流数据。
+-             */
+-            int64_t t1 = av_gettime_relative();
+-            int ret = ff_AMediaCodec_stop(codec);
+-            av_log(avctx, AV_LOG_INFO,
+-                   "mediacodec warm: prewarmed %s %dx%d csd=%d/%d -> %dx%d csd=%d/%d%s, "
+-                   "stopped for reconfigure in %d ms (ret %d, waited %d ms)\n",
+-                   s->codec_name, w->width, w->height, w->csd0_size, w->csd_size,
+-                   s->warm_width, s->warm_height, csd0_size, csd_size,
+-                   csd_same ? "" : " (csd differs)",
+-                   (int)((av_gettime_relative() - t1) / 1000), ret, (int)((t1 - t0) / 1000));
+-            if (ret < 0) {
+-                ff_AMediaCodec_delete(codec);
+-                codec = NULL;
+-            }
+-        }
++        av_log(avctx, AV_LOG_INFO, "mediacodec warm: using precreated %s (waited %d ms)\n",
++               s->codec_name, (int)((av_gettime_relative() - t0) / 1000));
+     } else {
+         av_log(avctx, AV_LOG_INFO,
+-               "mediacodec warm: prewarmed %s %s %dx%d ndk=%d csd=%d/%d does not match "
+-               "%s %s %dx%d ndk=%d csd=%d/%d%s, dropped\n",
+-               w->codec_name, w->mime, w->width, w->height, w->use_ndk_codec,
+-               w->csd0_size, w->csd_size,
+-               s->codec_name, mime, s->warm_width, s->warm_height, s->use_ndk_codec,
+-               csd0_size, csd_size, csd_same ? "" : " (csd differs)");
++               "mediacodec warm: precreated %s %s ndk=%d does not match %s %s ndk=%d, dropped\n",
++               w->codec_name, w->mime, w->use_ndk_codec,
++               s->codec_name, mime, s->use_ndk_codec);
+     }
+-    av_free(csd);
+     mediacodec_warm_free(w);
+     return codec;
+ }
+ 
+-void ff_mediacodec_dec_warm_disable(void)
+-{
+-    MediaCodecWarm *w;
+-
+-    pthread_mutex_lock(&mc_warm_mutex);
+-    mc_warm_disabled = 1;
+-    w = mc_warm;
+-    mc_warm = NULL;
+-    pthread_mutex_unlock(&mc_warm_mutex);
+-    av_log(NULL, AV_LOG_WARNING, "mediacodec warm: disabled for this process\n");
+-    mediacodec_warm_free(w);
+-}
+-
+ void ff_mediacodec_dec_warm_clear(void *native_window)
+ {
+     MediaCodecWarm *w = NULL;
+ 
++    /* 预建实例不绑输出目标，native_window 只是沿用原来的接口；一律删掉 */
++    (void)native_window;
+     pthread_mutex_lock(&mc_warm_mutex);
+     mediacodec_warm_wait_locked();
+-    if (mc_warm && (!native_window || mc_warm->window == native_window)) {
+-        w = mc_warm;
+-        mc_warm = NULL;
+-    }
++    w = mc_warm;
++    mc_warm = NULL;
+     pthread_mutex_unlock(&mc_warm_mutex);
+     mediacodec_warm_free(w);
+ }
+@@ -615,7 +448,7 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+         return;
+ 
+     if (atomic_fetch_sub(&s->refcount, 1) == 1) {
+-        /* 预热线程接手时由它 stop/delete，并顺手建好下一个实例 */
++        /* 后台线程接手时由它 stop/delete，并顺手建好下一个实例 */
+         if (s->codec && !mediacodec_warm_handoff(s))
+             ff_AMediaCodec_delete(s->codec);
+         s->codec = NULL;
+@@ -625,11 +458,6 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+             s->format = NULL;
+         }
+ 
+-        if (s->warm_format) {
+-            ff_AMediaFormat_delete(s->warm_format);
+-            s->warm_format = NULL;
+-        }
+-
+         if (s->surface) {
+             ff_mediacodec_surface_unref(s->surface, NULL);
+             s->surface = NULL;
+@@ -1105,8 +933,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+ }
+ 
+ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                                          const char *mime, FFAMediaFormat *format,
+-                                          int *codec_reused)
++                                          const char *mime, FFAMediaFormat *format)
+ {
+     int profile;
+ 
+@@ -1154,21 +981,11 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+         av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
+     }
+ 
+-    /* 和 format 里的宽高一致；init 后面解析输出 format 会改写 avctx，所以在这里记 */
+-    s->warm_width = avctx->width;
+-    s->warm_height = avctx->height;
+-
+-    /* 上一个流关闭时预热好的实例：已 configure + start，省掉整段建实例 */
+-    if (s->codec_name && s->surface && s->warm_codec && codec_reused) {
+-        int started = 0;
+-        s->codec = mediacodec_warm_take(avctx, s, mime, format, &started);
+-        if (s->codec) {
++    /* 上一个流关闭时后台预建好的同名实例：只 create 过，下面照常 configure + start */
++    if (s->codec_name && s->warm_codec) {
++        s->codec = mediacodec_warm_take(avctx, s, mime);
++        if (s->codec)
+             s->warm_reused = 1;
+-            if (started)
+-                *codec_reused = 1;
+-            else
+-                s->warm_restarted = 1;
+-        }
+     }
+ 
+     if (s->codec_name) {
+@@ -1224,31 +1041,29 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+     atomic_init(&s->hw_buffer_count, 0);
+     atomic_init(&s->serial, 1);
+     s->current_input_buffer = -1;
+-    int reused = 0;
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
+         ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
+     else if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
+-        ret = mediacodec_dec_get_video_codec(avctx, s, mime, format, &reused);
++        ret = mediacodec_dec_get_video_codec(avctx, s, mime, format);
+     else
+         av_assert0(0);
+     if (ret < 0)
+         goto fail;
+ 
+-    /* 领来的预热实例已经用同样的 format configure + start 过 */
+     int64_t t_cfg = av_gettime_relative(), t_start = t_cfg;
+-    status = reused ? 0 : ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
++    status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
+     if (status >= 0) {
+         t_start = av_gettime_relative();
+-        status = reused ? 0 : ff_AMediaCodec_start(s->codec);
++        status = ff_AMediaCodec_start(s->codec);
+     }
+-    if (status < 0 && s->warm_restarted) {
+-        /* 停下来重配的预热实例配不上：删掉，照常新建 */
++    if (status < 0 && s->warm_reused) {
++        /* 预建的实例配不上：删掉，照常新建 */
+         av_log(avctx, AV_LOG_WARNING,
+-               "mediacodec warm: restarting prewarmed %s failed (status = %d), creating a new one\n",
++               "mediacodec warm: precreated %s failed to configure/start (status = %d), creating a new one\n",
+                s->codec_name, status);
+         ff_AMediaCodec_delete(s->codec);
+-        s->warm_restarted = s->warm_reused = 0;
++        s->warm_reused = 0;
+         s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
+         if (!s->codec) {
+             ret = AVERROR_EXTERNAL;
+@@ -1271,11 +1086,11 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+         ret = AVERROR_EXTERNAL;
+         goto fail;
+     }
+-    if (!reused && avctx->codec_type == AVMEDIA_TYPE_VIDEO)
++    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
+         av_log(avctx, AV_LOG_INFO, "mediacodec: %s configure %d ms, start %d ms%s\n",
+                s->codec_name, (int)((t_start - t_cfg) / 1000),
+                (int)((av_gettime_relative() - t_start) / 1000),
+-               s->warm_restarted ? " (restarted prewarmed instance)" : "");
++               s->warm_reused ? " (precreated instance)" : "");
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+         s->format = ff_AMediaCodec_getOutputFormat(s->codec);
+@@ -1290,8 +1105,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+ 
+     av_log(avctx, AV_LOG_DEBUG, "MediaCodec %p started successfully\n", s->codec);
+ 
+-    /* 记下这一路的 mime（宽高在选解码器时已记好）：关闭时按它给下一个流预热实例 */
+-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->warm_codec && s->warm_width > 0) {
++    /* 记下这一路的 mime：关闭时按它给下一个流预建实例 */
++    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->warm_codec) {
+         s->warm_mime = av_strdup(mime);
+         s->warm_ready = s->warm_mime != NULL;
+     }
+@@ -1548,11 +1363,11 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+ 
+     /*
+      * 没有在外的帧（无待还的硬件缓冲、也没有别的引用）时，下面的 unref 就是最后一次：
+-     * stop/delete 交给预热线程，换台路径上不等，顺手给下一个流建好实例。
+-     * 帧还被别处握着时照旧当场 stop，最后一次 unref 时直接删除，不预热。
++     * stop/delete 交给后台线程，换台路径上不等，顺手给下一个流建好实例。
++     * 帧还被别处握着时照旧当场 stop，最后一次 unref 时直接删除，不预建。
+      */
+     s->warm_handoff = s->warm_ready && avctx && avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+-                      s->codec && s->codec_name && s->surface && s->warm_format &&
++                      s->codec && s->codec_name &&
+                       atomic_load(&s->hw_buffer_count) == 0 &&
+                       atomic_load(&s->refcount) == 1;
+     if (s->codec && !s->warm_handoff) {
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 9cecab3..b0c0eda 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -72,16 +72,12 @@ typedef struct MediaCodecDecContext {
+ 
+     bool use_ndk_codec;
+ 
+-    /* 换台预热（见 mediacodecdec_common.c 里 warm 一节的说明） */
+-    bool warm_codec;             /* 允许关闭时为下一个流预热实例 */
+-    int warm_ready;              /* init 完整成功，format 与属性可用于预热 */
+-    int warm_handoff;            /* close 时没有在外的帧，stop/delete 交给预热线程 */
+-    int warm_reused;             /* 这个实例是领来的预热实例 */
+-    int warm_restarted;          /* 领来的预热实例参数不同，stop 后按新 format 重新 configure */
+-    FFAMediaFormat *warm_format; /* configure 用过的 format，预热时原样复用 */
++    /* 换台预建实例（见 mediacodecdec_common.c 里 warm 一节的说明） */
++    bool warm_codec;             /* 允许关闭时为下一个流预建实例 */
++    int warm_ready;              /* init 完整成功，可以按 codec_name/warm_mime 预建 */
++    int warm_handoff;            /* close 时没有在外的帧，stop/delete 交给后台线程 */
++    int warm_reused;             /* 这个实例是领来的预建实例 */
+     char *warm_mime;
+-    int warm_width;              /* 选解码器时的宽高（init 解析输出 format 前），领用时按它比对 */
+-    int warm_height;
+ } MediaCodecDecContext;
+ 
+ int ff_mediacodec_dec_init(AVCodecContext *avctx,
+@@ -109,15 +105,12 @@ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
+                                   MediaCodecDecContext *s);
+ 
+ /**
+- * 删掉停在 native_window 上的预热实例（NULL 表示不管输出目标，全部删掉）。
+- * 输出目标（AImageReader 等）销毁前必须调用，否则预热实例一直占着一个硬解实例。
+- * 会先等正在跑的预热线程收尾（最多 1 秒）。
++ * 删掉预建好、还没被领走的实例。预建实例不绑输出目标，native_window 参数只为兼容
++ * 原来的调用方，忽略。播放器销毁输出目标（AImageReader 等）时调用，免得空闲实例
++ * 一直占着一个硬解实例。会先等正在跑的预建线程收尾（最多 1 秒）。
+  */
+ void ff_mediacodec_dec_warm_clear(void *native_window);
+ 
+-/** 本进程不再预热（领来的预热实例出过问题），并删掉已预热好的实例。 */
+-void ff_mediacodec_dec_warm_disable(void);
+-
+ typedef struct MediaCodecBuffer {
+ 
+     MediaCodecDecContext *ctx;
+-- 
+2.51.0.windows.1
+
