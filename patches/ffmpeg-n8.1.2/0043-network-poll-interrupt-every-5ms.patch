@@ -1,0 +1,48 @@
+From 16cad24d6874c95a8c59ed2726f2027bf15e26ea Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Mon, 16 Nov 2026 00:06:22 +0800
+Subject: [PATCH] =?UTF-8?q?perf(network):=20=E7=AD=89=E7=BD=91=E7=BB=9C?=
+ =?UTF-8?q?=E6=95=B0=E6=8D=AE=E6=97=B6=E6=AF=8F=205ms=20=E6=9F=A5=E4=B8=80?=
+ =?UTF-8?q?=E6=AC=A1=E4=B8=AD=E6=96=AD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+读线程卡在 poll() 等数据时，只有数据到了或者 POLLING_TIME 一片等完才会
+看到中断回调。这片原来是 100ms。直播转发源（udpxy、rtp2httpd 一类）
+常按几十毫秒一批往下发，换台 stop 时播放器要等下一批数据到了，读线程
+才退出。Pixel 上 FSPlayer 的 stop 里 join 读线程要 1~35ms，全算在下一台
+的等待里。
+
+改成 5ms。没数据的一片结束后只是重新 poll；各处超时都按片数折算
+（runs = timeout / POLLING_TIME），总时长不变。代价是空等时每秒多醒
+约 200 次，每次只是一次 poll 和一次中断回调。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavformat/network.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/network.h b/libavformat/network.h
+index 7c72c90..d7bb41c 100644
+--- a/libavformat/network.h
++++ b/libavformat/network.h
+@@ -246,7 +246,14 @@ const char *ff_gai_strerror(int ecode);
+ 
+ int ff_is_multicast_address(struct sockaddr *addr);
+ 
+-#define POLLING_TIME 100 /// Time in milliseconds between interrupt check
++/*
++ * Time in milliseconds between interrupt checks while waiting on a socket.
++ * A reader blocked in poll() only sees an abort request when data arrives or
++ * this slice ends; live TV relays often send in bursts tens of ms apart, so
++ * 100 ms made every channel change wait for the next burst. Slices that end
++ * without data just poll again; timeouts count slices, so they are unchanged.
++ */
++#define POLLING_TIME 5
+ 
+ /**
+  * Bind to a file descriptor and poll for a connection.
+-- 
+2.51.0.windows.1
+
