@@ -1,0 +1,599 @@
+From 973b1a30e10ed02a963eec9eb4f1a1a53e668bbe Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Sun, 15 Nov 2026 23:54:07 +0800
+Subject: [PATCH] =?UTF-8?q?perf(mpegts):=20=E5=85=B3=E9=94=AE=E5=B8=A7?=
+ =?UTF-8?q?=E5=BC=80=E5=A4=B4=E5=8F=82=E6=95=B0=E9=9B=86=E5=8D=B3=E5=A1=AB?=
+ =?UTF-8?q?=E8=A7=86=E9=A2=91=E5=8F=82=E6=95=B0=E6=89=A9=E5=88=B0=20HEVC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pixel 上 v12 之后 H.264 台的起播已和 Media3 持平，剩下两个 4K HEVC 台
+仍要 570~590ms（Media3 336~366ms）。HEVC 没走提前填参数：探测要等整个
+4K 关键帧收完、再用软解把它解一遍才拿到宽高和色彩，播放器之后才建硬解。
+
+early_video_params 现在也处理 HEVC：关键帧 PES 开头的 VPS/SPS/PPS 收全
+就填 extradata、宽高、profile/level、像素格式、SAR，以及 VUI 里的色彩
+范围、原色、传输特性、矩阵。色彩必须一起填：播放器开硬解时按它给读端
+声明数据空间，4K HLG/PQ 缺了会按 SDR 排布。H.264 和 HEVC 都改成收齐
+第一个图像 NAL 之前的全部参数集（一帧可能带多个 PPS），与
+extract_extradata 的结果一致。
+
+libavformat/hevc.c 新增 ff_hevc_decode_sps()，复用 hvcC 的 SPS/VUI 解析，
+顺带取出裁剪后的宽高、色度格式、位深、SAR 和色彩；profile_idc 为 0 时
+与 libavcodec 一样按兼容标志取第一个 profile。
+
+模拟器上逐项对照（同一文件，开/关选项）：
+- 4K HEVC Main10 HLG：探测 357ms -> 10ms，宽高、profile 2/level 153、
+  yuv420p10le、bt2020/arib-std-b67/bt2020nc 与正常探测一致；
+- 1080 场编码 HEVC（关键帧开头两个 PPS）：83ms -> 11ms，参数一致，
+  extradata 里四个参数集逐字节相同（只差起始码长度）；
+- 1080 HEVC 三种起点、H.264 三个样本（都含 GOP 中间切入）的前 40 个
+  视频包，以及 4K 样本的前 24 个视频包，大小、pts、CRC 与不开选项完全
+  一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavformat/hevc.c   | 158 ++++++++++++++++++++++++++++++-----
+ libavformat/hevc.h   |  23 ++++++
+ libavformat/mpegts.c | 193 ++++++++++++++++++++++++++++++-------------
+ 3 files changed, 297 insertions(+), 77 deletions(-)
+
+diff --git a/libavformat/hevc.c b/libavformat/hevc.c
+index 5924f39..a051441 100644
+--- a/libavformat/hevc.c
++++ b/libavformat/hevc.c
+@@ -23,6 +23,7 @@
+ #include "libavcodec/hevc/hevc.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
++#include "libavutil/pixdesc.h"
+ #include "avc.h"
+ #include "avio.h"
+ #include "avio_internal.h"
+@@ -45,6 +46,27 @@ enum {
+ #define FLAG_IS_NALFF           (1 << 1)
+ #define FLAG_IS_LHVC            (1 << 2)
+ 
++/* Table E-1, same as H.264 */
++static const AVRational hevc_sample_aspect_ratio[17] = {
++    {   0,  1 },
++    {   1,  1 },
++    {  12, 11 },
++    {  10, 11 },
++    {  16, 11 },
++    {  40, 33 },
++    {  24, 11 },
++    {  20, 11 },
++    {  32, 11 },
++    {  80, 33 },
++    {  18, 11 },
++    {  15, 11 },
++    {  64, 33 },
++    { 160, 99 },
++    {   4,  3 },
++    {   3,  2 },
++    {   2,  1 },
++};
++
+ typedef struct HVCCNALUnit {
+     uint8_t nuh_layer_id;
+     uint8_t parameter_set_id;
+@@ -84,6 +106,8 @@ typedef struct HEVCDecoderConfigurationRecord {
+     HVCCNALUnitArray arrays[NB_ARRAYS];
+ 
+     uint8_t alpha_layer_nuh_id;
++
++    HEVCSPSInfo *sps_info;  ///< filled by hvcc_parse_sps() if set (ff_hevc_decode_sps)
+ } HEVCDecoderConfigurationRecord;
+ 
+ typedef struct HVCCProfileTierLevel {
+@@ -310,24 +334,41 @@ static void hvcc_parse_vui(GetBitContext *gb,
+                            unsigned int max_sub_layers_minus1)
+ {
+     unsigned int min_spatial_segmentation_idc;
+-
+-    if (get_bits1(gb))              // aspect_ratio_info_present_flag
+-        if (get_bits(gb, 8) == 255) // aspect_ratio_idc
+-            skip_bits_long(gb, 32); // sar_width u(16), sar_height u(16)
++    HEVCSPSInfo *info = hvcc->sps_info;
++
++    if (get_bits1(gb)) {            // aspect_ratio_info_present_flag
++        unsigned aspect_ratio_idc = get_bits(gb, 8);
++        if (aspect_ratio_idc == 255) {
++            unsigned sar_width  = get_bits(gb, 16);
++            unsigned sar_height = get_bits(gb, 16);
++            if (info && sar_width && sar_height)
++                info->sar = (AVRational){ sar_width, sar_height };
++        } else if (info && aspect_ratio_idc < FF_ARRAY_ELEMS(hevc_sample_aspect_ratio)) {
++            info->sar = hevc_sample_aspect_ratio[aspect_ratio_idc];
++        }
++    }
+ 
+     if (get_bits1(gb))  // overscan_info_present_flag
+         skip_bits1(gb); // overscan_appropriate_flag
+ 
+     if (get_bits1(gb)) {  // video_signal_type_present_flag
+-        skip_bits(gb, 4); // video_format u(3), video_full_range_flag u(1)
+-
+-        if (get_bits1(gb)) // colour_description_present_flag
+-            /*
+-             * colour_primaries         u(8)
+-             * transfer_characteristics u(8)
+-             * matrix_coeffs            u(8)
+-             */
+-            skip_bits(gb, 24);
++        skip_bits(gb, 3); // video_format
++        if (get_bits1(gb) && info) // video_full_range_flag
++            info->color_range = AVCOL_RANGE_JPEG;
++
++        if (get_bits1(gb)) { // colour_description_present_flag
++            unsigned primaries = get_bits(gb, 8);
++            unsigned trc       = get_bits(gb, 8);
++            unsigned matrix    = get_bits(gb, 8);
++            if (info) {
++                if (av_color_primaries_name(primaries))
++                    info->color_primaries = primaries;
++                if (av_color_transfer_name(trc))
++                    info->color_trc = trc;
++                if (av_color_space_name(matrix))
++                    info->colorspace = matrix;
++            }
++        }
+     }
+ 
+     if (get_bits1(gb)) {        // chroma_loc_info_present_flag
+@@ -680,23 +721,45 @@ static int hvcc_parse_sps(GetBitContext *gb, HVCCNALUnit *nal,
+         if (get_bits1(gb)) // update_rep_format_flag
+             skip_bits(gb, 8); // sps_rep_format_idx
+     } else {
++        unsigned pic_width, pic_height, conf_left = 0, conf_right = 0, conf_top = 0, conf_bottom = 0;
++        int separate_colour_plane = 0;
++
+         hvcc->chromaFormat = get_ue_golomb_long(gb);
+ 
+         if (hvcc->chromaFormat == 3)
+-            skip_bits1(gb); // separate_colour_plane_flag
++            separate_colour_plane = get_bits1(gb); // separate_colour_plane_flag
+ 
+-        get_ue_golomb_long(gb); // pic_width_in_luma_samples
+-        get_ue_golomb_long(gb); // pic_height_in_luma_samples
++        pic_width  = get_ue_golomb_long(gb); // pic_width_in_luma_samples
++        pic_height = get_ue_golomb_long(gb); // pic_height_in_luma_samples
+ 
+-        if (get_bits1(gb)) {        // conformance_window_flag
+-            get_ue_golomb_long(gb); // conf_win_left_offset
+-            get_ue_golomb_long(gb); // conf_win_right_offset
+-            get_ue_golomb_long(gb); // conf_win_top_offset
+-            get_ue_golomb_long(gb); // conf_win_bottom_offset
++        if (get_bits1(gb)) {                     // conformance_window_flag
++            conf_left   = get_ue_golomb_long(gb); // conf_win_left_offset
++            conf_right  = get_ue_golomb_long(gb); // conf_win_right_offset
++            conf_top    = get_ue_golomb_long(gb); // conf_win_top_offset
++            conf_bottom = get_ue_golomb_long(gb); // conf_win_bottom_offset
+         }
+ 
+         hvcc->bitDepthLumaMinus8          = get_ue_golomb_long(gb);
+         hvcc->bitDepthChromaMinus8        = get_ue_golomb_long(gb);
++
++        if (hvcc->sps_info) {
++            HEVCSPSInfo *info = hvcc->sps_info;
++            /* 7.4.3.2.1: offsets are in chroma sample units (SubWidthC/SubHeightC) */
++            int chroma = separate_colour_plane ? 0 : hvcc->chromaFormat;
++            int unit_x = chroma == 1 || chroma == 2 ? 2 : 1;
++            int unit_y = chroma == 1 ? 2 : 1;
++
++            info->chroma_format_idc = chroma;
++            info->bit_depth_luma    = hvcc->bitDepthLumaMinus8 + 8;
++            if (pic_width <= 16888 && pic_height <= 16888) {
++                int64_t w = pic_width  - unit_x * ((int64_t)conf_left + conf_right);
++                int64_t h = pic_height - unit_y * ((int64_t)conf_top + conf_bottom);
++                if (w > 0 && h > 0) {
++                    info->width  = w;
++                    info->height = h;
++                }
++            }
++        }
+     }
+     log2_max_pic_order_cnt_lsb_minus4 = get_ue_golomb_long(gb);
+ 
+@@ -1408,3 +1471,56 @@ int ff_isom_write_lhvc(AVIOContext *pb, const uint8_t *data,
+     return write_configuration_record(logctx, pb, data, size,
+                                       (!!ps_array_completeness * FLAG_ARRAY_COMPLETENESS) | FLAG_IS_LHVC);
+ }
++
++int ff_hevc_decode_sps(HEVCSPSInfo *info, const uint8_t *buf, int buf_size)
++{
++    HEVCDecoderConfigurationRecord hvcc;
++    HVCCNALUnit nal = { 0 };
++    GetBitContext gb;
++    uint8_t *rbsp, nal_type, nuh_layer_id;
++    uint32_t rbsp_size;
++    int ret;
++
++    memset(info, 0, sizeof(*info));
++    info->sar             = (AVRational){ 0, 1 };
++    info->color_range     = AVCOL_RANGE_MPEG;
++    info->color_primaries = AVCOL_PRI_UNSPECIFIED;
++    info->color_trc       = AVCOL_TRC_UNSPECIFIED;
++    info->colorspace      = AVCOL_SPC_UNSPECIFIED;
++
++    if (buf_size < 3)
++        return AVERROR_INVALIDDATA;
++    rbsp = ff_nal_unit_extract_rbsp(buf, buf_size, &rbsp_size, 2);
++    if (!rbsp)
++        return AVERROR(ENOMEM);
++    ret = init_get_bits8(&gb, rbsp, rbsp_size);
++    if (ret < 0)
++        goto end;
++
++    nal_unit_parse_header(&gb, &nal_type, &nuh_layer_id);
++    if (nal_type != HEVC_NAL_SPS || nuh_layer_id) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++
++    hvcc_init(&hvcc);
++    hvcc.sps_info = info;
++    ret = hvcc_parse_sps(&gb, &nal, &hvcc);
++    hvcc_close(&hvcc);
++    if (ret < 0)
++        goto end;
++    if (get_bits_left(&gb) < 0 || !info->width || !info->height) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++    info->profile_idc = hvcc.general_profile_idc;
++    info->level_idc   = hvcc.general_level_idc;
++    /* like libavcodec: profile_idc 0 falls back to the first compatible profile */
++    for (int i = 1; !info->profile_idc && i < 32; i++)
++        if (hvcc.general_profile_compatibility_flags & (1U << (31 - i)))
++            info->profile_idc = i;
++
++end:
++    av_free(rbsp);
++    return ret;
++}
+diff --git a/libavformat/hevc.h b/libavformat/hevc.h
+index 83e149f..c0b816a 100644
+--- a/libavformat/hevc.h
++++ b/libavformat/hevc.h
+@@ -27,6 +27,7 @@
+ #define AVFORMAT_HEVC_H
+ 
+ #include <stdint.h>
++#include "libavutil/rational.h"
+ #include "avio.h"
+ 
+ /**
+@@ -116,4 +117,26 @@ int ff_isom_write_hvcc(AVIOContext *pb, const uint8_t *data,
+  */
+ int ff_isom_write_lhvc(AVIOContext *pb, const uint8_t *data,
+                        int size, int ps_array_completeness, void *logctx);
++
++typedef struct HEVCSPSInfo {
++    int width;              ///< picture width minus the conformance window
++    int height;             ///< picture height minus the conformance window
++    int profile_idc;        ///< general_profile_idc
++    int level_idc;          ///< general_level_idc
++    int chroma_format_idc;  ///< ChromaArrayType (0 with separate colour planes)
++    int bit_depth_luma;
++    AVRational sar;         ///< 0/1 if unknown
++    int color_range;        ///< enum AVColorRange
++    int color_primaries;    ///< enum AVColorPrimaries
++    int color_trc;          ///< enum AVColorTransferCharacteristic
++    int colorspace;         ///< enum AVColorSpace
++} HEVCSPSInfo;
++
++/**
++ * Parse a base-layer HEVC SPS NAL unit (2-byte NAL header included, emulation
++ * prevention bytes not removed).
++ *
++ * @return 0 on success, a negative AVERROR code on failure
++ */
++int ff_hevc_decode_sps(HEVCSPSInfo *info, const uint8_t *buf, int buf_size);
+ #endif /* AVFORMAT_HEVC_H */
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index 4382c27..4f5fd88 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -32,11 +32,13 @@
+ #include "libavutil/opt.h"
+ #include "libavutil/avassert.h"
+ #include "libavutil/dovi_meta.h"
++#include "libavutil/pixdesc.h"
+ #include "libavcodec/avcodec.h"
+ #include "libavcodec/bytestream.h"
+ #include "libavcodec/defs.h"
+ #include "libavcodec/get_bits.h"
+ #include "libavcodec/h264.h"
++#include "libavcodec/hevc/hevc.h"
+ #include "libavcodec/opus/opus.h"
+ #include "libavcodec/startcode.h"
+ #include "avformat.h"
+@@ -44,6 +46,7 @@
+ #include "internal.h"
+ #include "avio_internal.h"
+ #include "avc.h"
++#include "hevc.h"
+ #include "demux.h"
+ #include "mpeg.h"
+ #include "isom.h"
+@@ -167,7 +170,7 @@ struct MpegTSContext {
+ 
+     int scan_all_pmts;
+ 
+-    /** 视频 PES 开头带的 H.264 参数集一收全就填进流参数（见 mpegts_early_video_params） */
++    /** 视频 PES 开头带的 H.264/HEVC 参数集一收全就填进流参数（见 mpegts_early_video_params） */
+     int early_video_params;
+     /** 本次读包刚填好参数、没有包要交：mpegts_read_packet 返回 EAGAIN */
+     int early_params_ready;
+@@ -222,7 +225,7 @@ static const AVOption options[] = {
+      {.i64 = 0}, 0, 1, 0 },
+     {"max_packet_size", "maximum size of emitted packet", offsetof(MpegTSContext, max_packet_size), AV_OPT_TYPE_INT,
+      {.i64 = 204800}, 1, INT_MAX/2, AV_OPT_FLAG_DECODING_PARAM },
+-    {"early_video_params", "export H.264 SPS/PPS, size and profile as soon as the start of a video PES carries them",
++    {"early_video_params", "export H.264/HEVC parameter sets, size and profile as soon as the start of a video PES carries them",
+      offsetof(MpegTSContext, early_video_params), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
+     { NULL },
+ };
+@@ -1187,31 +1190,32 @@ static AVBufferRef *buffer_pool_get(MpegTSContext *ts, int size)
+ 
+ /* return non zero if a packet could be constructed */
+ /*
+- * 换台起播用（early_video_params）：H.264 关键帧 PES 开头的几个 TS 包里就带着 SPS/PPS，
++ * 换台起播用（early_video_params）：H.264/HEVC 关键帧 PES 开头的几个 TS 包里就带着参数集，
+  * 但整个 PES 要等下一个 PES 开头才吐成包，find_stream_info 再从这个包里取 extradata、
+- * 解析器才填宽高。关键帧有几十到上百 KB，这一段要等几十毫秒。
++ * 解析器才填宽高。关键帧有几十到上百 KB（4K HEVC 更大），这一段要等几十毫秒。
+  *
+- * 视频流还没有参数时，扫一眼正在攒的 PES 开头：SPS、PPS 都收全了，就把 extradata、
+- * 宽高、profile/level、像素格式直接填进 codecpar 和内部解码上下文，播放器可以先建硬解
+- * 实例，关键帧剩下的部分边下边等。在读包流程里（ts->pkt 非空）填好后让这一次读包
+- * 返回 EAGAIN：调用方（find_stream_info 的循环）回到循环顶上检查中断回调，播放器在
+- * 那里结束探测，不用等下一次网络读取时打断，那样会把读了一半的 TS 包丢掉。
++ * 视频流还没有参数时，扫一眼正在攒的 PES 开头：参数集（H.264 SPS/PPS，HEVC VPS/SPS/PPS）
++ * 都收全了，就把 extradata、宽高、profile/level、像素格式、SAR（HEVC 还有 VUI 里的色彩
++ * 属性，播放器按它给硬解输出声明 HDR 数据空间）直接填进 codecpar 和内部解码上下文，
++ * 播放器可以先建硬解实例，关键帧剩下的部分边下边等。在读包流程里（ts->pkt 非空）填好后
++ * 让这一次读包返回 EAGAIN：调用方（find_stream_info 的循环）回到循环顶上检查中断回调，
++ * 播放器在那里结束探测，不用等下一次网络读取时打断，那样会把读了一半的 TS 包丢掉。
+  */
+ #define EARLY_PARAMS_SCAN_MAX 8192
+ 
+-static enum AVPixelFormat early_h264_pix_fmt(const H264SPS *sps)
++static enum AVPixelFormat early_pix_fmt(int chroma_format_idc, int bit_depth)
+ {
+     static const enum AVPixelFormat fmt8[4]  = { AV_PIX_FMT_GRAY8, AV_PIX_FMT_YUV420P,
+                                                  AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P };
+     static const enum AVPixelFormat fmt10[4] = { AV_PIX_FMT_GRAY10, AV_PIX_FMT_YUV420P10,
+                                                  AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10 };
+ 
+-    if (sps->chroma_format_idc > 3)
++    if (chroma_format_idc < 0 || chroma_format_idc > 3)
+         return AV_PIX_FMT_NONE;
+-    if (sps->bit_depth_luma == 8)
+-        return fmt8[sps->chroma_format_idc];
+-    if (sps->bit_depth_luma == 10)
+-        return fmt10[sps->chroma_format_idc];
++    if (bit_depth == 8)
++        return fmt8[chroma_format_idc];
++    if (bit_depth == 10)
++        return fmt10[chroma_format_idc];
+     return AV_PIX_FMT_NONE;
+ }
+ 
+@@ -1233,54 +1237,115 @@ static int early_h264_profile(const H264SPS *sps)
+     return profile;
+ }
+ 
++#define EARLY_PS_MAX 8
++
++/** 参数集种类：H.264 0=SPS 1=PPS；HEVC 0=VPS 1=SPS 2=PPS；其它 NAL 返回 -1 */
++static int early_ps_kind(enum AVCodecID codec_id, const uint8_t *nal)
++{
++    if (codec_id == AV_CODEC_ID_HEVC) {
++        int type = (nal[-1] >> 1) & 0x3f;
++        if ((nal[-1] & 1) || (nal[0] >> 3)) /* nuh_layer_id != 0：只要基础层 */
++            return -1;
++        return type == HEVC_NAL_VPS ? 0 : type == HEVC_NAL_SPS ? 1 : type == HEVC_NAL_PPS ? 2 : -1;
++    } else {
++        int type = nal[-1] & 0x1f;
++        return type == H264_NAL_SPS ? 0 : type == H264_NAL_PPS ? 1 : -1;
++    }
++}
++
+ static void mpegts_early_video_params(PESContext *pes)
+ {
+     MpegTSContext *ts = pes->ts;
+     AVStream *st = pes->st;
+     FFStream *sti;
+-    const uint8_t *p, *end, *sps = NULL, *pps = NULL;
+-    int sps_size = 0, pps_size = 0, size;
+-    H264SPS info;
++    enum AVCodecID codec_id;
++    const uint8_t *p, *end, *ps[EARLY_PS_MAX], *sps = NULL;
++    int ps_size[EARLY_PS_MAX], nb_ps = 0, kinds = 0, all_kinds, sps_kind, min_size;
++    int sps_size = 0, size, i;
++    int width, height, profile, level, format;
++    int color_range = AVCOL_RANGE_UNSPECIFIED, color_primaries = AVCOL_PRI_UNSPECIFIED;
++    int color_trc = AVCOL_TRC_UNSPECIFIED, colorspace = AVCOL_SPC_UNSPECIFIED;
++    AVRational sar;
+     uint8_t *extradata, *copy = NULL;
+ 
+-    if (!st || st->codecpar->codec_id != AV_CODEC_ID_H264 || st->codecpar->extradata ||
+-        !pes->buffer)
++    if (!st || st->codecpar->extradata || !pes->buffer)
++        return;
++    codec_id = st->codecpar->codec_id;
++    if (codec_id != AV_CODEC_ID_H264 && codec_id != AV_CODEC_ID_HEVC)
+         return;
+     sti = ffstream(st);
+     if (sti->avctx && sti->avctx->extradata)
+         return;
++    all_kinds = codec_id == AV_CODEC_ID_HEVC ? 7 : 3;
++    sps_kind  = codec_id == AV_CODEC_ID_HEVC ? 1 : 0;
++    min_size  = codec_id == AV_CODEC_ID_HEVC ? 3 : 2;
+ 
++    /* 第一个图像 NAL 之前的参数集按原顺序全收（一帧可能带多个 PPS），和 extract_extradata 一致 */
+     p   = pes->buffer->data;
+     end = p + FFMIN(pes->data_index, EARLY_PARAMS_SCAN_MAX);
+-    while (p < end && !(sps && pps)) {
++    for (;;) {
+         uint32_t state = -1;
+         const uint8_t *nal = avpriv_find_start_code(p, end, &state);
+         const uint8_t *nal_end;
+-        int type;
++        int kind;
+ 
+         if (nal >= end)
+-            return;
+-        type = state & 0x1f;
+-        if (type == H264_NAL_SLICE || type == H264_NAL_IDR_SLICE)
+-            return; /* 到图像数据了：这个 PES 开头没有参数集 */
++            return; /* 下一个 NAL 还没收到 */
++        if (codec_id == AV_CODEC_ID_HEVC ? ((state >> 1) & 0x3f) < HEVC_NAL_VPS :
++            (state & 0x1f) == H264_NAL_SLICE || (state & 0x1f) == H264_NAL_IDR_SLICE)
++            break; /* 到图像数据了 */
+         nal_end = ff_nal_find_startcode(nal, end);
+         if (nal_end >= end)
+             return; /* 这个 NAL 还没收全，等后面的 TS 包 */
+-        if (type == H264_NAL_SPS && !sps) {
+-            sps      = nal - 1;
+-            sps_size = nal_end - sps;
+-        } else if (type == H264_NAL_PPS && !pps) {
+-            pps      = nal - 1;
+-            pps_size = nal_end - pps;
++        kind = early_ps_kind(codec_id, nal);
++        if (kind >= 0 && nb_ps < EARLY_PS_MAX) {
++            ps[nb_ps]      = nal - 1;
++            ps_size[nb_ps] = nal_end - ps[nb_ps];
++            if (ps_size[nb_ps] < min_size)
++                return;
++            if (kind == sps_kind && !sps) {
++                sps      = ps[nb_ps];
++                sps_size = ps_size[nb_ps];
++            }
++            kinds |= 1 << kind;
++            nb_ps++;
+         }
+         p = nal_end;
+     }
+-    if (!sps || !pps || sps_size < 4 || pps_size < 2)
+-        return;
+-    if (ff_avc_decode_sps(&info, sps + 1, sps_size - 1) < 0 || !info.width || !info.height)
+-        return;
++    if (kinds != all_kinds || sps_size < 4)
++        return; /* 这个 PES 开头没有完整的参数集 */
++
++    if (codec_id == AV_CODEC_ID_HEVC) {
++        HEVCSPSInfo info;
++
++        if (ff_hevc_decode_sps(&info, sps, sps_size) < 0)
++            return;
++        width   = info.width;
++        height  = info.height;
++        profile = info.profile_idc;
++        level   = info.level_idc;
++        format  = early_pix_fmt(info.chroma_format_idc, info.bit_depth_luma);
++        sar     = info.sar;
++        color_range     = info.color_range;
++        color_primaries = info.color_primaries;
++        color_trc       = info.color_trc;
++        colorspace      = info.colorspace;
++    } else {
++        H264SPS info;
+ 
+-    size = 4 + sps_size + 4 + pps_size;
++        if (ff_avc_decode_sps(&info, sps + 1, sps_size - 1) < 0 || !info.width || !info.height)
++            return;
++        width   = info.width;
++        height  = info.height;
++        profile = early_h264_profile(&info);
++        level   = info.level_idc;
++        format  = early_pix_fmt(info.chroma_format_idc, info.bit_depth_luma);
++        sar     = info.sar;
++    }
++
++    size = 0;
++    for (i = 0; i < nb_ps; i++)
++        size += 4 + ps_size[i];
+     extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+     if (sti->avctx)
+         copy = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+@@ -1289,37 +1354,53 @@ static void mpegts_early_video_params(PESContext *pes)
+         av_free(copy);
+         return;
+     }
+-    AV_WB32(extradata, 1);
+-    memcpy(extradata + 4, sps, sps_size);
+-    AV_WB32(extradata + 4 + sps_size, 1);
+-    memcpy(extradata + 8 + sps_size, pps, pps_size);
++    for (i = 0, size = 0; i < nb_ps; i++) {
++        AV_WB32(extradata + size, 1);
++        memcpy(extradata + size + 4, ps[i], ps_size[i]);
++        size += 4 + ps_size[i];
++    }
+ 
+     st->codecpar->extradata           = extradata;
+     st->codecpar->extradata_size      = size;
+-    st->codecpar->width               = info.width;
+-    st->codecpar->height              = info.height;
+-    st->codecpar->profile             = early_h264_profile(&info);
+-    st->codecpar->level               = info.level_idc;
+-    st->codecpar->format              = early_h264_pix_fmt(&info);
+-    st->codecpar->sample_aspect_ratio = info.sar;
++    st->codecpar->width               = width;
++    st->codecpar->height              = height;
++    st->codecpar->profile             = profile;
++    st->codecpar->level               = level;
++    st->codecpar->format              = format;
++    st->codecpar->sample_aspect_ratio = sar;
++    if (codec_id == AV_CODEC_ID_HEVC) {
++        st->codecpar->color_range     = color_range;
++        st->codecpar->color_primaries = color_primaries;
++        st->codecpar->color_trc       = color_trc;
++        st->codecpar->color_space     = colorspace;
++    }
+     if (sti->avctx) {
+         AVCodecContext *avctx = sti->avctx;
+         memcpy(copy, extradata, size);
+         av_freep(&avctx->extradata);
+         avctx->extradata           = copy;
+         avctx->extradata_size      = size;
+-        avctx->width               = info.width;
+-        avctx->height              = info.height;
+-        avctx->profile             = st->codecpar->profile;
+-        avctx->level               = info.level_idc;
+-        avctx->pix_fmt             = st->codecpar->format;
+-        avctx->sample_aspect_ratio = info.sar;
++        avctx->width               = width;
++        avctx->height              = height;
++        avctx->profile             = profile;
++        avctx->level               = level;
++        avctx->pix_fmt             = format;
++        avctx->sample_aspect_ratio = sar;
++        if (codec_id == AV_CODEC_ID_HEVC) {
++            avctx->color_range     = color_range;
++            avctx->color_primaries = color_primaries;
++            avctx->color_trc       = color_trc;
++            avctx->colorspace      = colorspace;
++        }
+     }
+ 
+     av_log(ts->stream, AV_LOG_INFO,
+-           "early video params: stream %d %dx%d profile %d level %d from the first %d bytes of a PES\n",
+-           st->index, info.width, info.height, st->codecpar->profile, info.level_idc,
+-           pes->data_index);
++           "early video params: stream %d %s %dx%d profile %d level %d %s %s/%s/%s "
++           "from the first %d bytes of a PES\n",
++           st->index, avcodec_get_name(codec_id), width, height, profile, level,
++           av_get_pix_fmt_name(format) ? av_get_pix_fmt_name(format) : "none",
++           av_color_primaries_name(color_primaries), av_color_transfer_name(color_trc),
++           av_color_space_name(colorspace), pes->data_index);
+ 
+     if (ts->pkt) {
+         ts->stop_parse = 1;
+-- 
+2.51.0.windows.1
+
