@@ -1,0 +1,158 @@
+From 228b49814329ee16c84915535c77c7dea78116a0 Mon Sep 17 00:00:00 2001
+From: ldm2060 <ldm200026@live.cn>
+Date: Sun, 15 Nov 2026 17:54:59 +0800
+Subject: [PATCH] =?UTF-8?q?fix(mediacodec):=20=E9=A2=84=E7=83=AD=E5=AE=9E?=
+ =?UTF-8?q?=E4=BE=8B=E9=A2=86=E7=94=A8=E5=8F=AA=E6=AF=94=20configure=20?=
+ =?UTF-8?q?=E7=94=A8=E5=88=B0=E7=9A=84=E5=8F=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+真机上预热实例每次都没被领用：同一个 c2.exynos.h264.decoder、同样 1920x1080，
+日志却是 does not match。原因是关闭时记下的色彩属性取自 init 之后的 avctx，
+init 里解析输出 format 会把它改写成解码器报的值，而下一路比对时用的是码流里
+原始的值（多半是 unspecified），永远对不上。
+
+configure 的 format 里只有 mime、宽高、csd 和 operating-rate，profile 和色彩
+属性都不进 format，比它们只会误伤。改成只比解码器名、mime、NDK/JNI 和宽高，
+宽高在选解码器时记下（init 改写 avctx 之前）。不匹配时的日志带上 mime 和
+NDK 标志，方便再排查。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ libavcodec/mediacodecdec_common.c | 44 ++++++++++++-------------------
+ libavcodec/mediacodecdec_common.h |  6 +----
+ 2 files changed, 18 insertions(+), 32 deletions(-)
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 79b7762..55d3157 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -269,8 +269,10 @@ static void ff_mediacodec_dec_ref(MediaCodecDecContext *s)
+  * （网络 + 探测还要几十到上百毫秒）直接领走这个从没喂过数据的实例，再把新流的 SPS/PPS
+  * 当 codec-config 送进去，省掉整段建实例；旧实例的 stop/delete 也不再压在换台路径上。
+  *
+- * 领用条件：解码器名、mime、profile、宽高、色彩属性都相同，输出 Surface 是同一个
+- * ANativeWindow。不满足而预热实例占着同一个 Surface 时，先同步删掉它再新建，否则新实例
++ * 领用条件只看 configure 真正用到的东西：解码器名、mime、宽高相同，输出 Surface 是同一个
++ * ANativeWindow。profile 和色彩属性不进 format，不比；宽高要取 init 之前的值，init 里
++ * 解析输出 format 会改写 avctx（色彩属性尤其如此，按改写后的值比永远对不上）。
++ * 不满足而预热实例占着同一个 Surface 时，先同步删掉它再新建，否则新实例
+  * configure 会因为 Surface 已被连接而失败。
+  *
+  * 只有 close 时没有在外的帧（refcount == 1、无待还的硬件缓冲）才走预热：帧还被渲染端
+@@ -285,12 +287,8 @@ typedef struct MediaCodecWarm {
+     char *codec_name;
+     char *mime;
+     int use_ndk_codec;
+-    int profile;
+     int width;
+     int height;
+-    int primaries;
+-    int trc;
+-    int colorspace;
+ } MediaCodecWarm;
+ 
+ static pthread_mutex_t mc_warm_mutex = PTHREAD_MUTEX_INITIALIZER;
+@@ -417,12 +415,8 @@ static int mediacodec_warm_handoff(MediaCodecDecContext *s)
+         return 0;
+     }
+     w->use_ndk_codec = s->use_ndk_codec;
+-    w->profile = s->warm_profile;
+     w->width = s->warm_width;
+     w->height = s->warm_height;
+-    w->primaries = s->warm_primaries;
+-    w->trc = s->warm_trc;
+-    w->colorspace = s->warm_colorspace;
+     w->old_codec = s->codec;
+     w->format = s->warm_format;
+ 
+@@ -455,7 +449,7 @@ static int mediacodec_warm_handoff(MediaCodecDecContext *s)
+  * 同一个 Surface 但参数不符时，同步删掉它，让新实例能 configure 到这个 Surface 上。
+  */
+ static FFAMediaCodec *mediacodec_warm_take(AVCodecContext *avctx, MediaCodecDecContext *s,
+-                                           const char *mime, int profile)
++                                           const char *mime)
+ {
+     ANativeWindow *window = mediacodec_warm_window(s->surface, avctx);
+     MediaCodecWarm *w = NULL;
+@@ -479,19 +473,18 @@ static FFAMediaCodec *mediacodec_warm_take(AVCodecContext *avctx, MediaCodecDecC
+         return NULL;
+ 
+     if (!strcmp(w->codec_name, s->codec_name) && !strcmp(w->mime, mime) &&
+-        w->use_ndk_codec == s->use_ndk_codec && w->profile == profile &&
+-        w->width == avctx->width && w->height == avctx->height &&
+-        w->primaries == avctx->color_primaries && w->trc == avctx->color_trc &&
+-        w->colorspace == avctx->colorspace) {
++        w->use_ndk_codec == s->use_ndk_codec &&
++        w->width == s->warm_width && w->height == s->warm_height) {
+         codec = w->codec;
+         w->codec = NULL;
+         av_log(avctx, AV_LOG_INFO, "mediacodec warm: using prewarmed %s %dx%d (waited %d ms)\n",
+-               s->codec_name, avctx->width, avctx->height,
++               s->codec_name, s->warm_width, s->warm_height,
+                (int)((av_gettime_relative() - t0) / 1000));
+     } else {
+         av_log(avctx, AV_LOG_INFO,
+-               "mediacodec warm: prewarmed %s %dx%d does not match %s %dx%d, dropped\n",
+-               w->codec_name, w->width, w->height, s->codec_name, avctx->width, avctx->height);
++               "mediacodec warm: prewarmed %s %s %dx%d ndk=%d does not match %s %s %dx%d ndk=%d, dropped\n",
++               w->codec_name, w->mime, w->width, w->height, w->use_ndk_codec,
++               s->codec_name, mime, s->warm_width, s->warm_height, s->use_ndk_codec);
+     }
+     mediacodec_warm_free(w);
+     return codec;
+@@ -1088,11 +1081,13 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+         av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
+     }
+ 
+-    s->warm_profile = profile;
++    /* 和 format 里的宽高一致；init 后面解析输出 format 会改写 avctx，所以在这里记 */
++    s->warm_width = avctx->width;
++    s->warm_height = avctx->height;
+ 
+     /* 上一个流关闭时预热好的实例：已 configure + start，省掉整段建实例 */
+     if (s->codec_name && s->surface && s->warm_codec && codec_reused) {
+-        s->codec = mediacodec_warm_take(avctx, s, mime, profile);
++        s->codec = mediacodec_warm_take(avctx, s, mime);
+         if (s->codec)
+             *codec_reused = 1;
+     }
+@@ -1197,14 +1192,9 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+ 
+     av_log(avctx, AV_LOG_DEBUG, "MediaCodec %p started successfully\n", s->codec);
+ 
+-    /* 记下这一路的参数：关闭时按它们给下一个流预热实例，领用时也按它们比对 */
+-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->warm_codec) {
++    /* 记下这一路的 mime（宽高在选解码器时已记好）：关闭时按它给下一个流预热实例 */
++    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO && s->warm_codec && s->warm_width > 0) {
+         s->warm_mime = av_strdup(mime);
+-        s->warm_width = avctx->width;
+-        s->warm_height = avctx->height;
+-        s->warm_primaries = avctx->color_primaries;
+-        s->warm_trc = avctx->color_trc;
+-        s->warm_colorspace = avctx->colorspace;
+         s->warm_ready = s->warm_mime != NULL;
+     }
+ 
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 5a387b1..ec05176 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -78,12 +78,8 @@ typedef struct MediaCodecDecContext {
+     int warm_handoff;            /* close 时没有在外的帧，stop/delete 交给预热线程 */
+     FFAMediaFormat *warm_format; /* configure 用过的 format，预热时原样复用 */
+     char *warm_mime;
+-    int warm_profile;
+-    int warm_width;
++    int warm_width;              /* 选解码器时的宽高（init 解析输出 format 前），领用时按它比对 */
+     int warm_height;
+-    int warm_primaries;
+-    int warm_trc;
+-    int warm_colorspace;
+     uint8_t *pending_csd;        /* 领用预热实例后，新流的 SPS/PPS 要当 codec-config 先送进去 */
+     int pending_csd_size;
+ } MediaCodecDecContext;
+-- 
+2.51.0.windows.1
+
